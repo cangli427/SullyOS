@@ -1256,11 +1256,14 @@ const Y520Scene: React.FC<Y520SceneProps> = ({ callA, charName, charAvatar, char
                         <span className="num">520</span>
                         <span style={{ fontFamily: "'Noto Serif SC', serif", fontSize: 11, letterSpacing: 2 }}>限定典藏</span>
                     </div>
-                    <div className="l520-charpill">
-                        {charAvatar?.startsWith('http') || charAvatar?.startsWith('data:')
-                            ? <img src={charAvatar} alt={charName} />
-                            : <span className="l520-charpill-emoji">{charAvatar || '🌸'}</span>}
-                        <span>{charName}</span>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                        <div className="l520-charpill">
+                            {charAvatar?.startsWith('http') || charAvatar?.startsWith('data:')
+                                ? <img src={charAvatar} alt={charName} />
+                                : <span className="l520-charpill-emoji">{charAvatar || '🌸'}</span>}
+                            <span>{charName}</span>
+                        </div>
+                        <BGMToggle />
                     </div>
                 </div>
                 <div className="l520-title-strip">
@@ -1510,6 +1513,7 @@ const UncoveredLineView: React.FC<{
                         <span>{charName}</span>
                     </div>
                     <div style={{ flex: 1 }} />
+                    <BGMToggle />
                 </div>
             </div>
             <div className="l520-stage" style={{ paddingBottom: 4 }}>
@@ -1728,6 +1732,109 @@ const LoadingView: React.FC<{ hint?: string }> = ({ hint }) => (
 );
 
 // ============================================================
+// 「珍重」BGM — 随机抽一条循环，全程贯穿，可静音切换
+// ============================================================
+
+/**
+ * 520 BGM URL 池。
+ * 在这里填外链/图床/CDN URL（支持 <audio src> 直接加载的 mp3/m4a/ogg/wav）。
+ * 进入活动时会从池里随机抽一条 loop 播放。空池时不播放、不报错。
+ */
+const LIKE520_BGM_URLS: string[] = [
+    // TODO: 填 BGM 链接
+];
+
+const BGM_MUTED_KEY = 'sullyos_like520_bgm_muted';
+const BGM_TARGET_VOLUME = 0.35;
+
+function useLike520BGM(active: boolean) {
+    const audioRef = useRef<HTMLAudioElement | null>(null);
+    const [muted, setMuted] = useState<boolean>(() => {
+        try { return localStorage.getItem(BGM_MUTED_KEY) === '1'; } catch { return false; }
+    });
+
+    useEffect(() => {
+        if (!active || LIKE520_BGM_URLS.length === 0) return;
+        const url = LIKE520_BGM_URLS[Math.floor(Math.random() * LIKE520_BGM_URLS.length)];
+        const audio = new Audio(url);
+        audio.loop = true;
+        audio.volume = 0;
+        audio.crossOrigin = 'anonymous';
+        audioRef.current = audio;
+        let canceled = false;
+        const p = audio.play();
+        if (p && typeof p.then === 'function') {
+            p.then(() => {
+                if (canceled) return;
+                const target = muted ? 0 : BGM_TARGET_VOLUME;
+                const steps = 12;
+                let i = 0;
+                const fade = setInterval(() => {
+                    i++;
+                    if (canceled || !audioRef.current) { clearInterval(fade); return; }
+                    audioRef.current.volume = Math.min(target, (i / steps) * target);
+                    if (i >= steps) clearInterval(fade);
+                }, 100);
+            }).catch(err => {
+                console.warn('[520][BGM] play failed (likely autoplay policy):', err);
+            });
+        }
+        return () => {
+            canceled = true;
+            try {
+                if (audioRef.current) {
+                    audioRef.current.pause();
+                    audioRef.current.src = '';
+                    audioRef.current = null;
+                }
+            } catch { /* ignore */ }
+        };
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [active]);
+
+    useEffect(() => {
+        if (audioRef.current) audioRef.current.volume = muted ? 0 : BGM_TARGET_VOLUME;
+        try { localStorage.setItem(BGM_MUTED_KEY, muted ? '1' : '0'); } catch { /* ignore */ }
+    }, [muted]);
+
+    const toggleMute = useCallback(() => setMuted(m => !m), []);
+    return { muted, toggleMute };
+}
+
+const BGMContext = React.createContext<{ muted: boolean; toggleMute: () => void } | null>(null);
+
+const BGMToggle: React.FC = () => {
+    const ctx = React.useContext(BGMContext);
+    if (!ctx || LIKE520_BGM_URLS.length === 0) return null;
+    const { muted, toggleMute } = ctx;
+    return (
+        <button
+            onClick={toggleMute}
+            title={muted ? '播放 BGM' : '静音'}
+            style={{
+                background: muted
+                    ? 'linear-gradient(180deg, rgba(255,248,236,0.95), rgba(245,234,212,0.85))'
+                    : 'linear-gradient(135deg, #f4e0a8 0%, #d4b16a 35%, #b8923f 65%, #8b6914 100%)',
+                color: muted ? '#8b6914' : '#fff8ec',
+                border: '1px solid #b8923f',
+                borderRadius: '50%',
+                width: 28,
+                height: 28,
+                display: 'inline-grid',
+                placeItems: 'center',
+                fontSize: 13,
+                cursor: 'pointer',
+                fontFamily: "'Cormorant Garamond', serif",
+                boxShadow: '0 2px 6px rgba(122,46,58,0.25), inset 0 1px 0 rgba(255,255,255,0.4)',
+                userSelect: 'none',
+            }}
+        >
+            {muted ? '🔇' : '♪'}
+        </button>
+    );
+};
+
+// ============================================================
 // Like520Session — 主状态机
 // ============================================================
 
@@ -1742,6 +1849,9 @@ export const Like520Session: React.FC<SessionProps> = ({ charId, onClose }) => {
 
     const [phase, setPhase] = useState<Phase>('intro');
     const [errorMsg, setErrorMsg] = useState<string>('');
+
+    // BGM 在 intro 之后启动（用户已点击进入 → 满足 autoplay policy）
+    const bgm = useLike520BGM(phase !== 'intro' && phase !== 'error');
 
     const [charChibi, setCharChibi] = useState<ChibiResult | null>(null);
     const [userChibi, setUserChibi] = useState<ChibiResult | null>(null);
@@ -1880,6 +1990,7 @@ export const Like520Session: React.FC<SessionProps> = ({ charId, onClose }) => {
     const background = 'linear-gradient(180deg, #FFF1E6 0%, #FFE4EC 100%)';
 
     return (
+        <BGMContext.Provider value={bgm}>
         <div className="fixed inset-0 z-[9997] overflow-y-auto" style={{ background }}>
             {phase === 'intro' && (
                 <div className="flex flex-col items-center justify-center min-h-full px-8 py-16 max-w-md mx-auto">
@@ -2006,6 +2117,7 @@ export const Like520Session: React.FC<SessionProps> = ({ charId, onClose }) => {
                 </div>
             )}
         </div>
+        </BGMContext.Provider>
     );
 };
 
