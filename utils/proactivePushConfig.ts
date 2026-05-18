@@ -26,6 +26,7 @@ const CLIENT_TOKEN = 'weqwqewqeqwdcsccagdgs32132';
 // ═══════════════════════════════════════════════════════════════════
 
 import { loadPushVapid, isPushVapidReady } from './pushVapid';
+import { KeepAlive } from './keepAlive';
 
 const ENABLED_STORAGE_KEY = 'proactive_push_enabled_v1';
 const LAST_WAKE_AT_KEY = 'proactive_push_last_wake_at_v1';
@@ -72,12 +73,15 @@ export function isPushConfigAvailable(): boolean {
 
 // ---------- Web Push subscription helpers ----------
 
-/** Convert base64url string to Uint8Array (for VAPID applicationServerKey). */
-function b64uToBytes(b64u: string): Uint8Array {
+/** Convert base64url string to Uint8Array<ArrayBuffer> (for VAPID applicationServerKey). */
+function b64uToBytes(b64u: string): Uint8Array<ArrayBuffer> {
   const padded = b64u.replace(/-/g, '+').replace(/_/g, '/')
     + '='.repeat((4 - (b64u.length % 4)) % 4);
   const bin = atob(padded);
-  const out = new Uint8Array(bin.length);
+  // 显式 ArrayBuffer 而不是默认 ArrayBufferLike (含 SharedArrayBuffer),
+  // 否则 PushManager.subscribe 在严格 TS lib (ArrayBufferView<ArrayBuffer>) 下挑不到重载.
+  const buf = new ArrayBuffer(bin.length);
+  const out = new Uint8Array(buf);
   for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
   return out;
 }
@@ -470,6 +474,100 @@ export async function resetSubscription(): Promise<{ ok: boolean; reason?: strin
 
   // ensureSubscribed will re-create from clean slate (permission, fresh
   // PushSubscription, fresh D1 row).
+  return ensureSubscribed();
+}
+
+/**
+ * 升级版重置: resetSubscription 的 subscribeWithRetry 全跑完仍拿到 zombie 时
+ * (Chromium 内部 PushMessagingAppIdentifier 被锁死在 MarkedForRemoval 状态,
+ * pushManager.unsubscribe 清不掉这个标记), 唯一可编程的逃离路径是 unregister
+ * Service Worker 再 register 一遍 — 新 SW 拿到新的 sw_registration_id, 绑死
+ * 在旧 id 上的坏 PushMessagingAppIdentifier 自然失效.
+ *
+ * 副作用:
+ *  - SW 短暂下线 (< 1s), 期间收到的 push 会真丢. 但深度重置本来就是"已经
+ *    收不到 push"才点的, 不存在"原本能收的现在丢了".
+ *  - SW 内的 proactive setInterval 全清. 调用方 (Settings.tsx 的 "深度重置"
+ *    handler) 必须在 deepResetSubscription resolve 后调一次
+ *    `ProactiveChat.resume()` 把 schedule 推回新 SW, 否则主动消息悄悄不响.
+ *  - KeepAlive 计数器清零. 跟"正在长 fetch"撞同一时刻概率近零, 不补救.
+ */
+export async function deepResetSubscription(): Promise<{ ok: boolean; reason?: string; endpoint?: string }> {
+  const cfg = loadPushConfig();
+  if (!cfg.workerUrl.startsWith('https://')) {
+    return { ok: false, reason: 'Worker URL 未配置' };
+  }
+  if (!isPushVapidReady()) {
+    return { ok: false, reason: 'VAPID 公钥未配置, 请到 Settings → Instant Push 生成' };
+  }
+  if (!('serviceWorker' in navigator) || !('PushManager' in window)) {
+    return { ok: false, reason: '当前浏览器不支持 Service Worker 或 Push API' };
+  }
+
+  // 1) 拿现有 sub 的 endpoint, 通知 Worker 删 D1 行 (best-effort)
+  let oldEndpoint: string | undefined;
+  try {
+    const reg = await navigator.serviceWorker.getRegistration();
+    if (reg) {
+      const sub = await reg.pushManager.getSubscription();
+      oldEndpoint = sub?.endpoint;
+      if (oldEndpoint) {
+        try {
+          await fetch(`${cfg.workerUrl}/unsubscribe`, {
+            method: 'POST',
+            headers: buildHeaders(cfg),
+            body: JSON.stringify({ endpoint: oldEndpoint }),
+          });
+        } catch { /* ignore */ }
+      }
+      // 2) 本地 unsubscribe (拿不掉 MarkedForRemoval 标记, 但走完流程)
+      if (sub) {
+        try { await sub.unsubscribe(); } catch { /* ignore */ }
+      }
+    }
+  } catch { /* 拿不到 reg 也继续; SW unregister 才是关键 */ }
+
+  // 3) Unregister 全部 SW registration — 关键步骤
+  try {
+    const regs = await navigator.serviceWorker.getRegistrations();
+    await Promise.all(regs.map(r => r.unregister().catch(() => false)));
+  } catch (e) {
+    console.warn('[ProactivePush] SW unregister failed', e);
+  }
+
+  // 4) 经 KeepAlive 走应用 boot 路径重 register — 同 scriptUrl + scope
+  try {
+    await KeepAlive.reregister();
+  } catch (e: any) {
+    return { ok: false, reason: `Service Worker 重新注册失败: ${e?.message || e}` };
+  }
+
+  // 5) 再保险等一次 ready (KeepAlive 内已 await 过, 这里防 race)
+  try {
+    await navigator.serviceWorker.ready;
+  } catch (e: any) {
+    return { ok: false, reason: `Service Worker ready 失败: ${e?.message || e}` };
+  }
+
+  // 6) 等 controller 切换 — 否则后续 postToSW (proactive sync) 会被 swallow.
+  //    新 SW activate 时已 clients.claim(), controllerchange 应该很快; 5s 兜底.
+  await new Promise<void>((resolve) => {
+    if (navigator.serviceWorker.controller) {
+      resolve();
+      return;
+    }
+    const onChange = () => {
+      navigator.serviceWorker.removeEventListener('controllerchange', onChange);
+      resolve();
+    };
+    navigator.serviceWorker.addEventListener('controllerchange', onChange);
+    setTimeout(() => {
+      navigator.serviceWorker.removeEventListener('controllerchange', onChange);
+      resolve();
+    }, 5000);
+  });
+
+  // 7) Fresh subscribe + POST /subscribe — 走 ensureSubscribed 全流程
   return ensureSubscribed();
 }
 

@@ -10,7 +10,7 @@ import { NotionManager, FeishuManager } from '../utils/realtimeContext';
 import { XhsMcpClient } from '../utils/xhsMcpClient';
 import { getMcdToken, setMcdToken as saveMcdToken, isMcdEnabled, setMcdEnabled as saveMcdEnabled, testMcdConnection, resetMcdSession } from '../utils/mcdMcpClient';
 import { Sun, Newspaper, NotePencil, Notebook, Book, ForkKnife } from '@phosphor-icons/react';
-import { loadPushConfig, savePushConfig, registerScheduleOnWorker, startHeartbeat, stopHeartbeat, isPushConfigAvailable, ensureSubscribed, sendTestPush, getPushDiagnostics, resetSubscription, type PushDiagnostics } from '../utils/proactivePushConfig';
+import { loadPushConfig, savePushConfig, registerScheduleOnWorker, startHeartbeat, stopHeartbeat, isPushConfigAvailable, ensureSubscribed, sendTestPush, getPushDiagnostics, resetSubscription, deepResetSubscription, type PushDiagnostics } from '../utils/proactivePushConfig';
 import { ProactiveChat } from '../utils/proactiveChat';
 import { InstantPushSettingsModal } from '../components/settings/InstantPushSettingsModal';
 import { PushVapidSettingsModal } from '../components/settings/PushVapidSettingsModal';
@@ -122,6 +122,10 @@ const Settings: React.FC = () => {
   const [ppDiag, setPpDiag] = useState<PushDiagnostics | null>(null);
   const [ppTestBusy, setPpTestBusy] = useState(false);
   const [ppResetBusy, setPpResetBusy] = useState(false);
+  const [ppDeepResetBusy, setPpDeepResetBusy] = useState(false);
+  // 连续 zombie 重置失败次数 — 累计 >= 3 时, "重置订阅" 按钮自动 morph 成
+  // "深度重置". 不持久化, 刷新页面归零 (用户原话: "刷新页面正常消失").
+  const [ppZombieStreak, setPpZombieStreak] = useState(0);
   const [showInstantModal, setShowInstantModal] = useState(false);
   const [showVapidModal, setShowVapidModal] = useState(false);
   const [vapidReadyTick, setVapidReadyTick] = useState(0); // 关闭 VAPID 弹窗后刷新顶层徽标
@@ -222,16 +226,41 @@ const Settings: React.FC = () => {
   };
 
   const doResetSubscription = async () => {
-      if (ppResetBusy) return;
+      if (ppResetBusy || ppDeepResetBusy) return;
       setPpResetBusy(true);
       setPpStatus('正在重置订阅…');
       const res = await resetSubscription();
       if (res.ok) {
+          setPpZombieStreak(0);
           setPpStatus('订阅已重建。可以再点"发一条测试推送"试一下。');
       } else {
-          setPpStatus(`重置失败：${res.reason || '未知错误'}`);
+          const reason = res.reason || '';
+          // 失败原因指向 zombie endpoint 时累计, 达到 3 次后按钮自动 morph 成深度重置
+          if (/permanently-removed|zombie/i.test(reason)) {
+              setPpZombieStreak(c => c + 1);
+          }
+          setPpStatus(`重置失败：${reason || '未知错误'}`);
       }
       setPpResetBusy(false);
+      await refreshPpDiag();
+  };
+
+  const doDeepResetSubscription = async () => {
+      if (ppDeepResetBusy || ppResetBusy) return;
+      setPpDeepResetBusy(true);
+      setPpStatus('正在深度重置…');
+      const res = await deepResetSubscription();
+      // 无论成败, 按钮都回归"重置订阅" — 下次出问题再次累计触发 morph
+      setPpZombieStreak(0);
+      if (res.ok) {
+          // ProactiveChat.resume() 把所有 schedule 推回新 SW. deepResetSubscription 内部
+          // 不调它是为了避免循环依赖 (ProactiveChat 反向依赖 proactivePushConfig).
+          try { ProactiveChat.resume(); } catch (e) { console.warn('[Settings] ProactiveChat.resume failed', e); }
+          setPpStatus('订阅已重建。可以再点"发一条测试推送"试一下。');
+      } else {
+          setPpStatus(`深度重置失败：${res.reason || '未知错误'}`);
+      }
+      setPpDeepResetBusy(false);
       await refreshPpDiag();
   };
 
@@ -1398,25 +1427,35 @@ const Settings: React.FC = () => {
                     <p className="text-[10px] text-slate-400">加载中…</p>
                 )}
 
-                <div className="mt-4 grid grid-cols-2 gap-2">
-                    <button
-                        disabled={ppTestBusy || ppResetBusy || !ppDiag?.endpoint || ppDiag?.endpointDead || ppDiag?.capacitorNative}
-                        onClick={() => void doSendTestPush()}
-                        className={`py-2 rounded-xl text-xs font-bold ${ppTestBusy || ppResetBusy || !ppDiag?.endpoint || ppDiag?.endpointDead || ppDiag?.capacitorNative ? 'bg-slate-200 text-slate-400' : 'bg-teal-500 text-white hover:bg-teal-600'}`}
-                    >
-                        {ppTestBusy ? '测试中…' : '发一条测试推送'}
-                    </button>
-                    <button
-                        disabled={ppResetBusy || ppTestBusy || ppDiag?.capacitorNative}
-                        onClick={() => void doResetSubscription()}
-                        className={`py-2 rounded-xl text-xs font-bold border ${ppResetBusy || ppTestBusy || ppDiag?.capacitorNative ? 'bg-slate-100 text-slate-400 border-slate-200' : ppDiag?.endpointDead ? 'bg-rose-500 text-white border-rose-500 hover:bg-rose-600' : 'bg-white text-slate-600 border-slate-200 hover:bg-slate-50'}`}
-                    >
-                        {ppResetBusy ? '重置中…' : '重置订阅'}
-                    </button>
-                </div>
+                {(() => {
+                    const inDeepMode = ppZombieStreak >= 3;
+                    const resetLabel = inDeepMode
+                        ? (ppDeepResetBusy ? '深度重置中…' : '深度重置')
+                        : (ppResetBusy ? '重置中…' : '重置订阅');
+                    const resetBusy = ppResetBusy || ppDeepResetBusy;
+                    return (
+                        <div className="mt-4 grid grid-cols-2 gap-2">
+                            <button
+                                disabled={ppTestBusy || resetBusy || !ppDiag?.endpoint || ppDiag?.endpointDead || ppDiag?.capacitorNative}
+                                onClick={() => void doSendTestPush()}
+                                className={`py-2 rounded-xl text-xs font-bold ${ppTestBusy || resetBusy || !ppDiag?.endpoint || ppDiag?.endpointDead || ppDiag?.capacitorNative ? 'bg-slate-200 text-slate-400' : 'bg-teal-500 text-white hover:bg-teal-600'}`}
+                            >
+                                {ppTestBusy ? '测试中…' : '发一条测试推送'}
+                            </button>
+                            <button
+                                disabled={resetBusy || ppTestBusy || ppDiag?.capacitorNative}
+                                onClick={() => inDeepMode ? void doDeepResetSubscription() : void doResetSubscription()}
+                                className={`py-2 rounded-xl text-xs font-bold border ${resetBusy || ppTestBusy || ppDiag?.capacitorNative ? 'bg-slate-100 text-slate-400 border-slate-200' : inDeepMode || ppDiag?.endpointDead ? 'bg-rose-500 text-white border-rose-500 hover:bg-rose-600' : 'bg-white text-slate-600 border-slate-200 hover:bg-slate-50'}`}
+                            >
+                                {resetLabel}
+                            </button>
+                        </div>
+                    );
+                })()}
                 <p className="text-[10px] text-slate-400 mt-2 leading-relaxed">
                     "测试推送"会让 Worker 立刻给你这台设备发一条 push，5 秒内系统通知里出现"推送测试成功"= 链路通。
-                    "重置订阅"会清掉本机的旧订阅 + 通知 Worker 删 D1 里的对应记录，重新走一遍权限/订阅流程；适合订阅失效或换浏览器后用。
+                    "重置订阅"会清掉旧订阅再建一个，适合订阅失效或换浏览器后用。
+                    {ppZombieStreak >= 3 && <><br/>连续几次都没成，已切到"深度重置"——点一下做一次更彻底的清理。</>}
                 </p>
             </div>
         </section>
