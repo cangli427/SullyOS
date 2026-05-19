@@ -108,13 +108,79 @@ async function xhsReplyComment(conf: { mcpUrl: string }, feedId: string, xsecTok
 // ─── 公开类型 ────────────────────────────────────────────────────────────────
 
 /**
- * Phase 2 预留: 当 worker 端的 agentic loop 跑完后, 用结构化 directive 数组把它发现/执行
- * 过的副作用 (RECALL / SEARCH / XHS_LIKE / ...) 传回主线程, 这里只负责"重放到 DB / UI",
- * 不重新扫原文。Phase 0 全部为空数组或 undefined。
+ * worker `onLLMOutput` hook 把识别到的副作用标签结构化传回, 客户端 applyAssistantPostProcessing
+ * 反向重建标签后让下游 chatParser / 内联 XHS handler 复用同一份执行逻辑 (避免在客户端再写一遍).
+ *
+ * 字段形状跟 worker/instant-push/src/classifier.ts:Directive 必须保持一致 — 用 type 做
+ * discriminator, 其他字段是 flat 而不是 nested payload (减少 push body 嵌套).
  */
-export interface PostProcessDirective {
-    type: string;
-    payload: any;
+export type PostProcessDirective =
+    | { type: 'poke' }
+    | { type: 'transfer'; amount: number }
+    | { type: 'add_event'; title: string; date: string }
+    | { type: 'schedule_message'; time: string; text: string }
+    | { type: 'music_action'; verb: string; args: string[] }
+    | { type: 'xhs_like'; noteId: string }
+    | { type: 'xhs_fav'; noteId: string }
+    | { type: 'xhs_comment'; noteId: string; text: string }
+    | { type: 'xhs_reply'; noteId: string; commentId: string; text: string }
+    | { type: 'xhs_post'; title: string; content: string; tags: string }
+    | { type: 'xhs_share'; idx: number };
+
+/**
+ * 把结构化 directive 反向拼回原 tag 字符串. 拼回的目的是让下游 chatParser.parseAndExecuteActions
+ * (POKE/TRANSFER/ADD_EVENT/schedule_message/MUSIC_ACTION) + 内联 XHS handler (LIKE/FAV/COMMENT/REPLY/POST/SHARE)
+ * 用跟本地 fetch 路径一致的代码执行 — 不在客户端为 push 路径再写一份副作用执行器.
+ *
+ * 已知边界 case: 字段含 `|` / `]` 时会破坏 tag 边界. worker 端 classifier 已经按 `[^|]+?`
+ * 切片, 所以这里反过来拼回去用户自定义内容里如果有 `|` 会重叠. 接受这个 trade-off — 本地
+ * fetch 路径里这种内容也有同样问题, 等于 push 路径不增加新 failure mode.
+ */
+function reconstructDirectiveTags(directives: PostProcessDirective[] | undefined): string {
+    if (!directives || directives.length === 0) return '';
+    const parts: string[] = [];
+    for (const d of directives) {
+        switch (d.type) {
+            case 'poke':
+                parts.push('[[ACTION:POKE]]');
+                break;
+            case 'transfer':
+                parts.push(`[[ACTION:TRANSFER:${d.amount}]]`);
+                break;
+            case 'add_event':
+                parts.push(`[[ACTION:ADD_EVENT|${d.title}|${d.date}]]`);
+                break;
+            case 'schedule_message':
+                parts.push(`[schedule_message | ${d.time} | fixed | ${d.text}]`);
+                break;
+            case 'music_action': {
+                const tail = d.args && d.args.length > 0 ? `|${d.args.join('|')}` : '';
+                parts.push(`[[MUSIC_ACTION:${d.verb}${tail}]]`);
+                break;
+            }
+            case 'xhs_like':
+                parts.push(`[[XHS_LIKE:${d.noteId}]]`);
+                break;
+            case 'xhs_fav':
+                parts.push(`[[XHS_FAV:${d.noteId}]]`);
+                break;
+            case 'xhs_comment':
+                parts.push(`[[XHS_COMMENT:${d.noteId} | ${d.text}]]`);
+                break;
+            case 'xhs_reply':
+                parts.push(`[[XHS_REPLY:${d.noteId} | ${d.commentId} | ${d.text}]]`);
+                break;
+            case 'xhs_post':
+                parts.push(`[[XHS_POST:${d.title} | ${d.content} | ${d.tags}]]`);
+                break;
+            case 'xhs_share':
+                parts.push(`[[XHS_SHARE:${d.idx}]]`);
+                break;
+            default:
+                console.warn('[directive-replay] unknown directive type, skipping', d);
+        }
+    }
+    return parts.length > 0 ? `${parts.join('\n')}\n\n` : '';
 }
 
 /** XHS reply-related caches — 跨消息存活, 调用方负责持有 (一般是 useRef 包起来) */
@@ -202,6 +268,12 @@ export interface PostProcessCtx {
      * Phase 0 始终为 [] / undefined。
      */
     directives?: PostProcessDirective[];
+    /**
+     * Phase 2 Round 2: push 路径 reasoning chain 来源. SW 把 ReasoningPush 写到
+     * reasoning_buffer, flushInboxToChat 在处理 sessionId 的第一条 content 时 claim
+     * 出来塞到这里. 本地 fetch 路径不传 (Step 4 仍从 initialData.choices[0].message.reasoning_content 读).
+     */
+    reasoningContent?: string;
 }
 
 // ─── 主入口 ─────────────────────────────────────────────────────────────────
@@ -229,6 +301,7 @@ export async function applyAssistantPostProcessing(
         hooks,
         skipSecondPassLLM,
         directives,
+        reasoningContent: pushReasoningContent,
     } = ctx;
     const { baseUrl, headers, effectiveApi } = api;
     const {
@@ -254,8 +327,21 @@ export async function applyAssistantPostProcessing(
     // 的正则覆盖 ACTION/RECALL/SEARCH/DIARY/READ_DIARY/FS_DIARY/FS_READ_DIARY/...),
     // XHS_* / READ_NOTE 兜底用 Step 12 的 hasDisplayContent + per-chunk sanitize 再清一遍。
     // 写日记类 (DIARY / FS_DIARY) 不走 LLM, 属于纯副作用 (像 POKE), 客户端可以直接执行。
-    // Phase 2: directives 非空时只重放结构化指令, 暂时未启用, 留为预留接口。
-    void directives;
+    // Phase 2 Round 2: directives 非空时, worker 已经把副作用标签结构化传过来 (并从 push body
+    // 里剥光了). 我们重建原 tag 字符串塞回 rawAiContent 头部, 让下游 chatParser.parseAndExecuteActions
+    // + 后置 XHS_* 内联 handler 用同一份代码执行 — 零重复实现, 跟本地 fetch 路径同一份 source of truth.
+    // tag 末尾 +\n\n 保证不跟正文粘连导致 regex 漏匹配; chatParser.sanitize 会把它们清干净.
+    const replayedTagPrefix = reconstructDirectiveTags(directives);
+    const hasReplayDirectives = !!directives && directives.length > 0;
+
+    // Phase 1 把 XHS 副作用 (LIKE/FAV/COMMENT/REPLY/POST/SHARE) 跟 2nd-pass LLM tools (SEARCH/BROWSE/
+    // DETAIL/MY_PROFILE) 一起用 skipSecondPassLLM 关掉了. Round 2 拆开: 副作用类只需要 MCP 调用,
+    // 不需要 LLM round-trip, 当 worker 给了 directives 时 (xhs_* in classifier) 这些 tag 已重建回正文,
+    // 必须执行. 用 disabledXhsSideEffects = (skipSecondPassLLM && !hasReplayDirectives) 区分:
+    //   - 本地 fetch 路径: skipSecondPassLLM=false → false → 不禁用, 跟历史行为一致
+    //   - Phase 1 push 路径 (老 worker, 无 directives): true && true → 禁用 (旧 trade-off 不变)
+    //   - Phase 2 push 路径 (Round 2 worker, 有 directives): true && false → 不禁用, 副作用照常跑
+    const disabledXhsSideEffects = skipSecondPassLLM && !hasReplayDirectives;
 
     /** 从缓存或 notesPool 中查找 xsecToken — 仅副作用 XHS handler (COMMENT/REPLY/LIKE/FAV) 使用 */
     const findXsecToken = (noteId: string, notesPool: XhsNote[]): string | undefined => {
@@ -287,7 +373,7 @@ export async function applyAssistantPostProcessing(
     let data: any = initialData;
 
     // ─── Step 1: 初次粗洗 ───
-    let aiContent = rawAiContent;
+    let aiContent = replayedTagPrefix ? `${replayedTagPrefix}${rawAiContent}` : rawAiContent;
     aiContent = normalizeAiContent(aiContent);
 
     // ─── Step 2: 二轮 LLM 钩子 ───
@@ -862,7 +948,7 @@ export async function applyAssistantPostProcessing(
     aiContent = aiContent.replace(/\[\[XHS_BROWSE(?::.*?)?\]\]/g, '').trim();
 
     // [[XHS_SHARE: 序号]]
-    const xhsShareMatches: Iterable<RegExpMatchArray> = skipSecondPassLLM ? [] : aiContent.matchAll(/\[\[XHS_SHARE:\s*(\d+)\]\]/g);
+    const xhsShareMatches: Iterable<RegExpMatchArray> = disabledXhsSideEffects ? [] : aiContent.matchAll(/\[\[XHS_SHARE:\s*(\d+)\]\]/g);
     for (const shareMatch of xhsShareMatches) {
         const idx = parseInt(shareMatch[1]) - 1;
         if (idx >= 0 && idx < lastXhsNotesRef.current.length) {
@@ -882,7 +968,7 @@ export async function applyAssistantPostProcessing(
 
     // [[XHS_POST: 标题 | 内容 | #标签1 #标签2]]
     const xhsPostMatch = aiContent.match(/\[\[XHS_POST:\s*(.+?)\]\]/s);
-    if (!skipSecondPassLLM && xhsPostMatch && xhsConf.enabled) {
+    if (!disabledXhsSideEffects && xhsPostMatch && xhsConf.enabled) {
         const postRaw = xhsPostMatch[1].trim();
         const parts = postRaw.split('|').map(p => p.trim());
         const postTitle = parts[0] || '';
@@ -913,14 +999,14 @@ export async function applyAssistantPostProcessing(
         }
         aiContent = aiContent.replace(xhsPostMatch[0], '').trim();
         setXhsStatus('');
-    } else if (!skipSecondPassLLM && xhsPostMatch) {
+    } else if (!disabledXhsSideEffects && xhsPostMatch) {
         aiContent = aiContent.replace(xhsPostMatch[0], '').trim();
     }
     aiContent = aiContent.replace(/\[\[XHS_POST:.*?\]\]/gs, '').trim();
 
     // [[XHS_COMMENT: noteId | 评论内容]]
     const xhsCommentMatch = aiContent.match(/\[\[XHS_COMMENT:\s*(.+?)\]\]/);
-    if (!skipSecondPassLLM && xhsCommentMatch && xhsConf.enabled) {
+    if (!disabledXhsSideEffects && xhsCommentMatch && xhsConf.enabled) {
         const commentRaw = xhsCommentMatch[1].trim();
         const sepIdx = commentRaw.indexOf('|');
         if (sepIdx > 0) {
@@ -949,14 +1035,14 @@ export async function applyAssistantPostProcessing(
         }
         aiContent = aiContent.replace(xhsCommentMatch[0], '').trim();
         setXhsStatus('');
-    } else if (!skipSecondPassLLM && xhsCommentMatch) {
+    } else if (!disabledXhsSideEffects && xhsCommentMatch) {
         aiContent = aiContent.replace(xhsCommentMatch[0], '').trim();
     }
     aiContent = aiContent.replace(/\[\[XHS_COMMENT:.*?\]\]/g, '').trim();
 
     // [[XHS_REPLY: noteId | commentId | 回复内容]] (first pass; before LIKE/FAV)
     const xhsReplyMatch = aiContent.match(/\[\[XHS_REPLY:\s*(.+?)\]\]/);
-    if (!skipSecondPassLLM && xhsReplyMatch && xhsConf.enabled) {
+    if (!disabledXhsSideEffects && xhsReplyMatch && xhsConf.enabled) {
         const parts = xhsReplyMatch[1].split('|').map(s => s.trim());
         if (parts.length >= 3) {
             const [noteId, commentId, ...replyParts] = parts;
@@ -1011,13 +1097,13 @@ export async function applyAssistantPostProcessing(
             }
         }
         aiContent = aiContent.replace(xhsReplyMatch[0], '').trim();
-    } else if (!skipSecondPassLLM && xhsReplyMatch) {
+    } else if (!disabledXhsSideEffects && xhsReplyMatch) {
         aiContent = aiContent.replace(xhsReplyMatch[0], '').trim();
     }
     aiContent = aiContent.replace(/\[\[XHS_REPLY:.*?\]\]/g, '').trim();
 
     // [[XHS_LIKE: noteId]]
-    const xhsLikeMatches: Iterable<RegExpMatchArray> = skipSecondPassLLM ? [] : aiContent.matchAll(/\[\[XHS_LIKE:\s*(.+?)\]\]/g);
+    const xhsLikeMatches: Iterable<RegExpMatchArray> = disabledXhsSideEffects ? [] : aiContent.matchAll(/\[\[XHS_LIKE:\s*(.+?)\]\]/g);
     for (const xhsLikeMatch of xhsLikeMatches) {
         if (xhsConf.enabled) {
             const noteId = xhsLikeMatch[1].trim();
@@ -1036,7 +1122,7 @@ export async function applyAssistantPostProcessing(
     aiContent = aiContent.replace(/\[\[XHS_LIKE:.*?\]\]/g, '').trim();
 
     // [[XHS_FAV: noteId]]
-    const xhsFavMatches: Iterable<RegExpMatchArray> = skipSecondPassLLM ? [] : aiContent.matchAll(/\[\[XHS_FAV:\s*(.+?)\]\]/g);
+    const xhsFavMatches: Iterable<RegExpMatchArray> = disabledXhsSideEffects ? [] : aiContent.matchAll(/\[\[XHS_FAV:\s*(.+?)\]\]/g);
     for (const xhsFavMatch of xhsFavMatches) {
         if (xhsConf.enabled) {
             const noteId = xhsFavMatch[1].trim();
@@ -1163,7 +1249,7 @@ export async function applyAssistantPostProcessing(
     // 5.10.1 Second-round XHS action processing
     // [[XHS_COMMENT: noteId | 评论内容]] (second round)
     const xhsCommentMatch2 = aiContent.match(/\[\[XHS_COMMENT:\s*(.+?)\]\]/);
-    if (!skipSecondPassLLM && xhsCommentMatch2 && xhsConf.enabled) {
+    if (!disabledXhsSideEffects && xhsCommentMatch2 && xhsConf.enabled) {
         const commentRaw = xhsCommentMatch2[1].trim();
         const sepIdx = commentRaw.indexOf('|');
         if (sepIdx > 0) {
@@ -1195,7 +1281,7 @@ export async function applyAssistantPostProcessing(
 
     // [[XHS_REPLY]] (second round)
     const xhsReplyMatch2 = aiContent.match(/\[\[XHS_REPLY:\s*(.+?)\]\]/);
-    if (!skipSecondPassLLM && xhsReplyMatch2 && xhsConf.enabled) {
+    if (!disabledXhsSideEffects && xhsReplyMatch2 && xhsConf.enabled) {
         const parts = xhsReplyMatch2[1].split('|').map(s => s.trim());
         if (parts.length >= 3) {
             const [noteId, commentId, ...replyParts] = parts;
@@ -1253,7 +1339,7 @@ export async function applyAssistantPostProcessing(
     aiContent = aiContent.replace(/\[\[XHS_REPLY:.*?\]\]/g, '').trim();
 
     // [[XHS_LIKE]] (second round)
-    const xhsLikeMatches2: Iterable<RegExpMatchArray> = skipSecondPassLLM ? [] : aiContent.matchAll(/\[\[XHS_LIKE:\s*(.+?)\]\]/g);
+    const xhsLikeMatches2: Iterable<RegExpMatchArray> = disabledXhsSideEffects ? [] : aiContent.matchAll(/\[\[XHS_LIKE:\s*(.+?)\]\]/g);
     for (const xhsLikeMatch of xhsLikeMatches2) {
         if (xhsConf.enabled) {
             const noteId = xhsLikeMatch[1].trim();
@@ -1272,7 +1358,7 @@ export async function applyAssistantPostProcessing(
     aiContent = aiContent.replace(/\[\[XHS_LIKE:.*?\]\]/g, '').trim();
 
     // [[XHS_FAV]] (second round)
-    const xhsFavMatches2: Iterable<RegExpMatchArray> = skipSecondPassLLM ? [] : aiContent.matchAll(/\[\[XHS_FAV:\s*(.+?)\]\]/g);
+    const xhsFavMatches2: Iterable<RegExpMatchArray> = disabledXhsSideEffects ? [] : aiContent.matchAll(/\[\[XHS_FAV:\s*(.+?)\]\]/g);
     for (const xhsFavMatch of xhsFavMatches2) {
         if (xhsConf.enabled) {
             const noteId = xhsFavMatch[1].trim();
@@ -1292,7 +1378,7 @@ export async function applyAssistantPostProcessing(
 
     // [[XHS_POST]] (second round - after MY_PROFILE)
     const xhsPostMatch2 = aiContent.match(/\[\[XHS_POST:\s*(.+?)\]\]/s);
-    if (!skipSecondPassLLM && xhsPostMatch2 && xhsConf.enabled) {
+    if (!disabledXhsSideEffects && xhsPostMatch2 && xhsConf.enabled) {
         const postRaw = xhsPostMatch2[1].trim();
         const parts = postRaw.split('|').map(p => p.trim());
         const postTitle = parts[0] || '';
@@ -1327,10 +1413,16 @@ export async function applyAssistantPostProcessing(
     aiContent = await ChatParser.parseAndExecuteActions(aiContent, char.id, char.name, addToast, musicHooks);
 
     // ─── Step 4: thinking chain 抽取 ───
+    // push 路径 (ctx.reasoningContent 非空) 优先用 worker 写到 reasoning_buffer 的内容;
+    // 本地 fetch 路径走 data.choices[0].message.reasoning_content (initialData 或 2nd-pass result).
     let pendingThinkingChain: string | null = null;
     if ((char as any).showThinkingChain) {
         const lastRaw = data?.choices?.[0]?.message?.content || '';
-        const lastReasoning = (data?.choices?.[0]?.message?.reasoning_content || '').trim();
+        const lastReasoning = (
+            (pushReasoningContent && pushReasoningContent.trim())
+            || data?.choices?.[0]?.message?.reasoning_content
+            || ''
+        ).trim();
         const thinkBlocks: string[] = [];
         const thinkPat = /<(think|thinking|thought)>([\s\S]*?)<\/\1>/gi;
         let tm: RegExpExecArray | null;

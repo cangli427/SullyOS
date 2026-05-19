@@ -1,7 +1,14 @@
 import { ActiveMsg2InboxMessage, APIConfig, RealtimeConfig, UserProfile } from '../types';
 import { DB } from './db';
 import { ActiveMsgStore } from './activeMsgStore';
-import { applyAssistantPostProcessing, type XhsCaches } from './applyAssistantPostProcessing';
+import {
+  applyAssistantPostProcessing,
+  type PostProcessDirective,
+  type XhsCaches,
+} from './applyAssistantPostProcessing';
+import { runPendingToolCalls } from './instantToolRunner';
+import { processNewMessages } from './memoryPalace/pipeline';
+import { evaluateEmotionBackground } from '../hooks/useChatAI';
 
 let initialized = false;
 
@@ -14,6 +21,22 @@ const pushXhsCaches: XhsCaches = {
   commentUserIdCache: new Map(),
   commentAuthorNameCache: new Map(),
   commentParentIdCache: new Map(),
+};
+
+type MemoryPalaceGlobalConfig = {
+  embedding: { baseUrl: string; apiKey: string; model: string; dimensions: number };
+  lightLLM: { baseUrl: string; apiKey: string; model: string };
+};
+
+/** 从 localStorage 读 memoryPalaceConfig — OSContext 同步存的是 os_memory_palace_config key */
+const loadMemoryPalaceConfigFromLocalStorage = (): MemoryPalaceGlobalConfig | undefined => {
+  try {
+    const raw = localStorage.getItem('os_memory_palace_config');
+    if (!raw) return undefined;
+    return JSON.parse(raw) as MemoryPalaceGlobalConfig;
+  } catch {
+    return undefined;
+  }
 };
 
 /** 从 localStorage 读 APIConfig (与 OSContext load 逻辑保持一致, 但这里在 React 之外跑) */
@@ -81,17 +104,20 @@ const processInboxMessageWithPostProcessing = async (message: ActiveMsg2InboxMes
     }));
   };
 
-  // Phase 2 Round 1: 如果 worker (Round 2) 发的 reasoning push 已经被 SW 写到 reasoning_buffer,
+  // Phase 2 Round 2: 如果 worker 自动发的 ReasoningPush 已经被 SW 写到 reasoning_buffer,
   // 在处理"这个 sessionId 的第一条 content"时把 reasoning_content 反取出来挂到 ctx, 让 thinking
-  // chain 卡片能渲染到第一条 assistant message 的 metadata.thinkingChain.
-  // Round 1 worker 还在 0.6 one-shot, 不会发 reasoning push, claimReasoning 始终返回 null.
+  // chain 卡片渲染到第一条 assistant message 的 metadata.thinkingChain.
+  // Round 1 worker 在 0.6 one-shot 时不发 reasoning push, claimReasoning 始终返回 null — 无副作用.
+  // messageIndex 来源: SW 在 saveContentToInbox 把 payload.messageIndex 写到 metadata. Round 2
+  // worker 用 1-based (buildContentPush 第 1 条 → messageIndex=1); 老 worker 没这个字段, ?? 0 fallback.
+  // 只对 first content claim (避免 N 条 push 同 session 时重复读 / 第 2 条挂错 metadata).
   const sessionId: string | undefined = (message as any).sessionId
     || (message.metadata && (message.metadata as any).sessionId);
   const messageIndex: number = (message as any).messageIndex
     ?? (message.metadata && (message.metadata as any).messageIndex)
     ?? 0;
   let reasoningContent: string | undefined;
-  if (sessionId && messageIndex === 0) {
+  if (sessionId && messageIndex <= 1) {
     try {
       const buffered = await ActiveMsgStore.claimReasoning(sessionId);
       reasoningContent = buffered?.reasoningContent;
@@ -99,7 +125,6 @@ const processInboxMessageWithPostProcessing = async (message: ActiveMsg2InboxMes
       console.warn('[ActiveMsg] claimReasoning failed', sessionId, e);
     }
   }
-  void reasoningContent;  // 当前 applyAssistantPostProcessing 还没消费这个字段, Round 2 接入
 
   await applyAssistantPostProcessing(message.body || '', {
     char,
@@ -156,9 +181,120 @@ const processInboxMessageWithPostProcessing = async (message: ActiveMsg2InboxMes
       // Phase 1 接受 "push 来的消息看不到音乐卡片" 这个 trade-off, Phase 2 再补回来。
     },
     skipSecondPassLLM: true,
-    directives: [],
+    // 把 worker hook 塞进 metadata.directives 的副作用结构化重放出来 (POKE/TRANSFER/ADD_EVENT/
+    // schedule_message/MUSIC_ACTION/XHS_*). applyAssistantPostProcessing 会反向拼回 tag 喂给
+    // chatParser + 内联 XHS handler.
+    directives: extractDirectives(message),
+    reasoningContent,
   });
+
+  // ─── Phase 2 Round 2 (2f): Memory Palace + emotion eval 尾段 ───
+  // 这一段跟 useChatAI.ts:finally 字节级对齐 — push 路径走完 applyAssistantPostProcessing
+  // (落库 + chunks) 后, 把 Memory Palace 缓冲区 + 情绪评估也跑一遍, 否则 push 来的消息会被
+  // palace 永久漏掉 / buff 不更新. 非阻塞: 都用 .catch 包 (Memory Palace pipeline 自带并发锁,
+  // emotion eval 是 fire-and-forget). 失败只 log, 不抛.
+  await runPushTailPipeline(message, char, userProfile, contextMsgs);
 };
+
+/** 把 worker 推给的 directives 从 inbox message metadata 里挖出来; 没有就空数组. */
+function extractDirectives(message: ActiveMsg2InboxMessage): PostProcessDirective[] {
+  const raw = message.metadata && (message.metadata as any).directives;
+  if (!Array.isArray(raw)) return [];
+  // 字段形状由 worker classifier 保证 (跟 PostProcessDirective union 一致); 这里只做轻量校验
+  // 防 metadata 被改坏. 不识别的 type 不抛错, applyAssistantPostProcessing 内部 default 分支会 warn.
+  return raw.filter((d) => d && typeof d === 'object' && typeof (d as any).type === 'string');
+}
+
+/**
+ * 跑 push 路径的尾段: Memory Palace 缓冲区处理 + 情绪评估.
+ *
+ * 这两块在 useChatAI 里都依赖 React state/refs 注入 (charRef / setMemoryPalaceStatus /
+ * setEvolvedNarrative / setEmotionStatus). 在 React 外面跑时降级:
+ *   - charRef 检查 → 直接用 push 时拿到的 char (不存在"用户切角色"的并发, push 是被动消费)
+ *   - setMemoryPalaceStatus → no-op (UI 没法显示这个状态, palace 自带并发锁仍能保证不重入)
+ *   - setEvolvedNarrative → 写回 char.evolvedNarrative 经 DB.saveCharacter 持久化, 让下次 send
+ *     时本地 fetch 路径读到 (跟 React 内 setEvolvedNarrative 后被 effect 写回 DB 等价)
+ *   - autoArchive / 50 轮认知消化: 跟 React 内逻辑一样, 但这些已经在 pipeline.then 内部 self-contained
+ */
+async function runPushTailPipeline(
+  message: ActiveMsg2InboxMessage,
+  char: import('../types').CharacterProfile,
+  userProfile: UserProfile,
+  contextMsgs: import('../types').Message[],
+): Promise<void> {
+  // 1. Memory Palace
+  const mpConfig = loadMemoryPalaceConfigFromLocalStorage();
+  const mpEmb = mpConfig?.embedding;
+  const mpLLMConfigured = mpConfig?.lightLLM;
+  const apiConfig = loadApiConfigFromLocalStorage();
+  const mpLLM = (mpLLMConfigured?.baseUrl)
+    ? mpLLMConfigured
+    : { baseUrl: apiConfig.baseUrl, apiKey: apiConfig.apiKey, model: apiConfig.model };
+
+  if ((char as any).memoryPalaceEnabled && mpEmb?.baseUrl && mpEmb?.apiKey && mpLLM.baseUrl) {
+    try {
+      const recentMsgs = await DB.getRecentMessagesByCharId(char.id, 50);
+      // fire-and-forget: pipeline 内部有并发锁 + 水位线检查, 不会抢着跑两份
+      void processNewMessages(
+        recentMsgs,
+        char.id,
+        char.name,
+        mpEmb,
+        mpLLM,
+        userProfile?.name || '',
+        false,
+        (stage) => { console.log('[push:memory-palace]', stage); },
+      ).catch((e) => {
+        console.warn('[push:memory-palace] processNewMessages failed', e);
+      });
+    } catch (e) {
+      console.warn('[push:memory-palace] tail kickoff failed', e);
+    }
+  }
+
+  // 2. 情绪评估 (innerState 演化)
+  // useChatAI 那边的 gate: isScheduleFeatureOn(char) && char.emotionConfig?.enabled. push 路径只取
+  // emotionConfig.enabled — isScheduleFeatureOn 跟 char.scheduleStyle 强相关, 在 React 外面拉运行时
+  // ref 太啰嗦, 简化成"角色开了 emotionConfig 就跑"; 误差是 schedule off 但 emotionConfig on 的边缘配置
+  // 也会触发, 业务上无害.
+  const emotionConfig = (char as any).emotionConfig;
+  if (emotionConfig?.enabled) {
+    const emotionApi = (emotionConfig.api?.baseUrl)
+      ? emotionConfig.api
+      : { baseUrl: apiConfig.baseUrl, apiKey: apiConfig.apiKey, model: apiConfig.model };
+    // mainSystemPrompt + apiMessages: 我们没法重建 useChatAI 那一套精确的 systemPrompt (会包括 buff
+    // 注入 / 世界书 / persona / live context 等), push 路径用一个最小版替代: char.systemPrompt + 最近
+    // 50 条聊天作为 apiMessages, 让情绪 eval 看到的是"角色定义 + 近期对话". 评估精度比 fetch 路径低,
+    // 但能正确驱动 buff/innerState 演化方向. 后续可改成把 outbound_session.messages 喂进来.
+    const apiMessages = contextMsgs.slice(-50).map((m) => ({
+      role: m.role,
+      content: typeof m.content === 'string' ? m.content : '',
+    }));
+    const systemPrompt = char.systemPrompt || '';
+    try {
+      const innerState = await evaluateEmotionBackground(char, userProfile, systemPrompt, apiMessages, emotionApi);
+      if (innerState) {
+        // 写回角色 evolvedNarrative — useChatAI 走 setEvolvedNarrative React state 后被 OSContext
+        // effect 同步到 DB 的, 这里直接 DB.saveCharacter 短路, 下次 send 时被读取注入 prompt.
+        try {
+          const latest = (await DB.getAllCharacters()).find((c) => c.id === char.id);
+          if (latest) {
+            await DB.saveCharacter({ ...latest, evolvedNarrative: innerState } as any);
+          }
+        } catch (e) {
+          console.warn('[push:emotion-eval] saveCharacter failed', e);
+        }
+      }
+    } catch (e) {
+      console.warn('[push:emotion-eval] evaluateEmotionBackground failed', e);
+    }
+  }
+
+  // 顺手通过 message 触发 'emotion-updated' (跟 useChatAI line 382 一致), 让 UI 重新读 char
+  try {
+    window.dispatchEvent(new CustomEvent('emotion-updated', { detail: { charId: char.id } }));
+  } catch { /* SSR-safe / not browser, ignore */ }
+}
 
 const flushInboxToChat = async () => {
   const pendingMessages = await ActiveMsgStore.consumeInboxMessages();
@@ -244,21 +380,12 @@ const flushInboxToChat = async () => {
   }
 };
 
-// Phase 2 Round 1 stub: 在启动时排空可能存在的 pending_tool_calls. Round 1 这个 store 应该
-// 永远是空的 (worker 还没升级到 0.8 / SW 也没分轨), 但留下消费器:
-//   - 万一升级时机不同步 (SW 比 main thread 先升), store 有数据时不至于死锁
-//   - Round 2 切换到真实 tool runner 时直接替换函数体即可
-const runPendingToolCallsPlaceholder = async () => {
+// Phase 2 Round 2: 真实 tool runner. 启动时排空 + SW postMessage 触发. 失败诊断在 instantToolRunner 内.
+const runPendingToolCallsSafely = async () => {
   try {
-    const pending = await ActiveMsgStore.consumePendingToolCalls();
-    if (pending.length > 0) {
-      console.warn(
-        `[instant-push] ${pending.length} pending tool calls dropped — tool runner not yet wired (Phase 2 Round 2)`,
-        pending.map(p => ({ sessionId: p.sessionId, charId: p.charId, toolCount: p.toolCalls.length })),
-      );
-    }
+    await runPendingToolCalls();
   } catch (e) {
-    console.warn('[instant-push] consumePendingToolCalls failed at startup', e);
+    console.warn('[instant-push] runPendingToolCalls failed', e);
   }
 };
 
@@ -290,17 +417,28 @@ export const ActiveMsgRuntime = {
           return;
         }
 
+        // Phase 2 Round 2: SW 收到 tool_request push 且当前 window visible → 立即跑 runner.
+        // 不 visible 时 SW 发的是 showNotification, 用户点击后落到 active-msg-open 分支,
+        // ActiveMsgRuntime.init 时这里的启动消费会兜底 (runPendingToolCallsSafely).
+        if (type === 'instant-tool-request') {
+          void runPendingToolCallsSafely();
+          return;
+        }
+
         if (type === 'active-msg-open') {
           void flushInboxToChat().then(() => {
             window.dispatchEvent(new CustomEvent('active-msg-open', {
               detail: { charId: event.data?.charId },
             }));
           });
+          // notification → open 路径里大概率刚好有一条 pending_tool_call 等着 (visibility=false
+          // 时 SW 走的通知支线), 顺手消费一次.
+          void runPendingToolCallsSafely();
         }
       });
     }
 
-    await runPendingToolCallsPlaceholder();
+    await runPendingToolCallsSafely();
     await flushInboxToChat();
     handleDeepLink();
   },
