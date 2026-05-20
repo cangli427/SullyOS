@@ -114,6 +114,11 @@ async function runOnePendingToolCall(item: InstantPushPendingToolCall): Promise<
   // (从 push.metadata.iteration 透传). /continue 必须严格递增, worker 端 fail-fast 400 守.
   const nextIteration = (item.iteration ?? 0) + 1;
 
+  // amsg-instant 0.6.0+ 强校验 avatarUrl: 仅接受 http(s), data: URI 直接 INVALID_PAYLOAD_FORMAT.
+  // SullyOS 角色头像基本是 base64 存的, 直传会被包侧拒. 没有公网 URL 就干脆不传 — 通知端
+  // 用 worker 自己的默认图标. 同 useChatAI.ts:693 的处理.
+  const safeAvatarUrl = /^https?:\/\//i.test(char.avatar || '') ? char.avatar : undefined;
+
   const body = JSON.stringify({
     sessionId: item.sessionId,
     iteration: nextIteration,
@@ -123,7 +128,7 @@ async function runOnePendingToolCall(item: InstantPushPendingToolCall): Promise<
     apiKey: session.apiCredentials.apiKey || apiConfig.apiKey,
     primaryModel: session.apiCredentials.model || apiConfig.model,
     contactName: char.name,
-    avatarUrl: char.avatar,
+    avatarUrl: safeAvatarUrl,
     charId: item.charId,
     metadata: { charId: item.charId, charName: char.name },
     temperature: 0.8,
