@@ -302,7 +302,7 @@ async function removeQueuedRequest(id) {
 }
 
 // worker/sw-keep-alive.ts
-var SW_VERSION = "1.5.1";
+var SW_VERSION = "1.5.2";
 var PING_INTERVAL = 15e3;
 var MAX_MANUAL_ALIVE_MS = 5 * 6e4;
 var ACTIVE_MSG_DB_NAME = "ActiveMsg";
@@ -444,8 +444,7 @@ async function saveContentToInbox(payload) {
   const payloadTimestamp = payload?.timestamp;
   const parsedSentAt = payloadTimestamp ? new Date(payloadTimestamp).getTime() : NaN;
   const sentAt = Number.isFinite(parsedSentAt) ? parsedSentAt : Date.now();
-  const directives = Array.isArray(payload?.metadata?.directives) ? payload.metadata.directives : [];
-  if (!charId || !body && directives.length === 0) return;
+  if (!charId) return;
   const db = await openInboxDb();
   await new Promise((resolve, reject) => {
     const tx = db.transaction(ACTIVE_MSG_INBOX_STORE, "readwrite");

@@ -20,8 +20,10 @@ import { installReiSW } from '@rei-standard/amsg-sw';
  *           tool_request 按 visibility 决定 postMessage 或 showNotification。
  *  - 1.5.1: saveContentToInbox 兼容 directive-only push (body 空但 metadata.directives
  *           非空, e.g. LLM 只输出 [[ACTION:POKE]] 时), 不再 early-return 漏掉副作用.
+ *  - 1.5.2: saveContentToInbox gate 化简到只看 charId — directive-only / 空 payload
+ *           都信任 worker 契约, 不在 SW 二次验证, 行为更可预测.
  */
-const SW_VERSION = '1.5.1';
+const SW_VERSION = '1.5.2';
 
 const PING_INTERVAL = 15_000;
 const MAX_MANUAL_ALIVE_MS = 5 * 60_000;
@@ -205,11 +207,13 @@ async function saveContentToInbox(payload: any) {
   const parsedSentAt = payloadTimestamp ? new Date(payloadTimestamp).getTime() : NaN;
   const sentAt = Number.isFinite(parsedSentAt) ? parsedSentAt : Date.now();
 
-  // Round 2: directive-only push (e.g. LLM 只输出 `[[ACTION:POKE]]`, worker classifier 把
-  // tag 剥光后 cleanedText 是空串, 但 metadata.directives 非空) 是合法形态, 不能 early-return.
-  // 老 gate 只为防"完全空白的脏 push 污染 inbox" — 现在改成 (没有 charId) 或 (body 和 directives 都空) 才退.
-  const directives = Array.isArray(payload?.metadata?.directives) ? payload.metadata.directives : [];
-  if (!charId || (!body && directives.length === 0)) return;
+  // 唯一不可恢复的是没 charId — 没法路由, 直接丢. 其它形态都接受:
+  //   - body 非空 + directives 空 = 普通 content push (老路径)
+  //   - body 非空 + directives 非空 = content + 副作用混合 push
+  //   - body 空 + directives 非空 = directive-only push (LLM 只输 [[ACTION:POKE]] 等)
+  //   - body 空 + directives 空 = worker bug 推白条 → 写一条空 entry, flushInbox 跑空管线无害,
+  //     最多让 OSContext 弹一句默认 toast. 这种 case 应该在 worker 端修, SW 不二次验证契约.
+  if (!charId) return;
 
   const db = await openInboxDb();
   await new Promise<void>((resolve, reject) => {
