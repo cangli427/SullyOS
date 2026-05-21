@@ -207,3 +207,143 @@ export function sanitizeForBubble(
   result = collapseWhitespace(result);
   return result;
 }
+
+// ─── Segments API (amsg-instant 0.8.0-next.4+ pushPayloads) ────────────────
+
+/**
+ * 一段内容 → 一条 push.
+ *  - `raw`: 给客户端 `message` 字段, 保留 SEND_EMOJI / [html] 等业务标签让
+ *           applyAssistantPostProcessing Step 5/8/9 正确渲染气泡 (sticker / HTML 卡)
+ *  - `sanitized`: 给 `notification.body`, OS banner 显示用的可读 placeholder
+ *
+ * 两个字段在大多数 chunk 上是一样的 (普通文本); 只有原子单元 (SEND_EMOJI / [html])
+ * 时两者才分叉.
+ */
+export interface Segment {
+  raw: string;
+  sanitized: string;
+}
+
+/**
+ * worker push notification + bubble 共用的分段器.
+ *
+ * 算法:
+ *  1. Phase 1 — 全文 strip suppress content (think 块 / INNER_STATE / 业务标签 /
+ *     时间戳 leak / 引用 / source tag / 历史 leak / divider / 老 trans). 必须先全文
+ *     跑, 因为 think 跨多行, 单行 chunk 看不到完整块.
+ *  2. Phase 2 — chunkText: 按 `\n` 切 + 按 CJK 字符之间的空格切, 跟客户端
+ *     `chatParser.chunkText` 字节对齐 (LLM 在 prompt 引导下用换行断句).
+ *  3. Phase 3 — 每个 chunk 内拆 SEND_EMOJI 独立成段, 文字段跑 banner-only 替换
+ *     (markdown link / [html] / markdown header/bold/backtick).
+ *
+ * 不切句号 — 客户端 chunkText 也不切, 保持气泡数 == banner 数.
+ *
+ * 返回空数组的情况: LLM 整段输出 sanitize 完只剩 think / 业务标签 / 空白 — 此时
+ * 不发任何 banner / bubble (skip-push 语义).
+ */
+export function sanitizeIntoSegments(text: string): Segment[] {
+  // Phase 1: 全文 suppress
+  let cleaned = stripLiteralBackslashN(text);
+  cleaned = stripThinkBlocks(cleaned);
+  cleaned = extractTranslationOriginal(cleaned);
+  cleaned = stripInnerState(cleaned);
+  cleaned = stripBusinessTagsForNotification(cleaned);
+  cleaned = stripTimestamps(cleaned);
+  cleaned = stripChineseDate(cleaned);
+  cleaned = stripRoleNamePrefix(cleaned);
+  cleaned = stripSourceTags(cleaned);
+  cleaned = stripQuotes(cleaned);
+  cleaned = stripLegacyTrans(cleaned);
+  cleaned = stripMarkdownDividers(cleaned);
+
+  // Phase 2: chunk 跟客户端 chatParser.chunkText 同算法 (内联避免 import chatParser
+  // 把 DB / React / Capacitor 依赖拖进 worker bundle)
+  const rawChunks = chunkText(cleaned);
+
+  // Phase 3: 拆 SEND_EMOJI + banner-only 替换
+  const segments: Segment[] = [];
+  for (const rawChunk of rawChunks) {
+    const parts = splitOnSendEmoji(rawChunk);
+    for (const part of parts) {
+      if (part.kind === 'emoji') {
+        segments.push({
+          raw: `[[SEND_EMOJI: ${part.name}]]`,
+          sanitized: `[表情：${part.name}]`,
+        });
+        continue;
+      }
+      const rawText = part.text.trim();
+      if (!rawText) continue;
+      const sanitized = sanitizeTextForBanner(rawText).trim();
+      if (!sanitized) continue;
+      segments.push({ raw: rawText, sanitized });
+    }
+  }
+  return segments;
+}
+
+/**
+ * 单个文字 chunk 的 banner-side 替换. 不动 raw 文字, 只产 sanitized 版本.
+ * SEND_EMOJI 已经在 splitOnSendEmoji 阶段独立成段, 这里不处理.
+ */
+function sanitizeTextForBanner(text: string): string {
+  let result = text;
+  result = replaceHtmlBlocks(result);       // [html]...[/html] → [HTML 卡片] (chunk 内 inline)
+  result = replaceEmojiReverseTag(result);  // [xxx 发送了表情包: yyy] → [表情：yyy]
+  result = replaceMarkdownLinks(result);    // [text](url) → [链接：text]
+  result = stripMarkdownHeaders(result);
+  result = stripMarkdownBold(result);
+  result = stripBackticks(result);
+  result = collapseWhitespace(result);
+  return result;
+}
+
+/**
+ * `chatParser.chunkText` 的无依赖版本. 行为字节对齐:
+ *  1. 按换行符切 (\n / \r\n / \r /   /  )
+ *  2. 每个 chunk 再按 CJK 字符之间的空格切 (中文里本不该有空格 = LLM 想断行)
+ *  3. trim + filter empty
+ */
+function chunkText(text: string): string[] {
+  const CJK = '\\u4e00-\\u9fff\\u3400-\\u4dbf\\u3000-\\u303f\\uff00-\\uffef\\u2000-\\u206f\\u2e80-\\u2eff\\u3001-\\u3003\\u2018-\\u201f\\u300a-\\u300f\\uff01-\\uff0f\\uff1a-\\uff20';
+  const cjkSpaceRe = new RegExp(`(?<=[${CJK}])\\s+(?=[${CJK}])`);
+
+  const lineChunks = text.split(/(?:\r\n|\r|\n|\u2028|\u2029)+/)
+    .map((c) => c.trim())
+    .filter((c) => c.length > 0);
+
+  const out: string[] = [];
+  for (const chunk of lineChunks) {
+    const sub = chunk.split(cjkSpaceRe)
+      .map((c) => c.trim())
+      .filter((c) => c.length > 0);
+    out.push(...sub);
+  }
+  return out;
+}
+
+/**
+ * 把 chunk 里的 `[[SEND_EMOJI: 名称]]` 拆出来当独立 part. 跟客户端
+ * `chatParser.splitResponse` 行为对齐 (输出 shape 不同, 这里用 kind 字段区分).
+ */
+function splitOnSendEmoji(chunk: string): Array<
+  | { kind: 'text'; text: string }
+  | { kind: 'emoji'; name: string }
+> {
+  const re = /\[\[SEND_EMOJI:\s*(.*?)\]\]/g;
+  const parts: Array<{ kind: 'text'; text: string } | { kind: 'emoji'; name: string }> = [];
+  let lastIndex = 0;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(chunk)) !== null) {
+    if (m.index > lastIndex) {
+      parts.push({ kind: 'text', text: chunk.slice(lastIndex, m.index) });
+    }
+    parts.push({ kind: 'emoji', name: m[1].trim() });
+    lastIndex = m.index + m[0].length;
+  }
+  if (lastIndex < chunk.length) {
+    parts.push({ kind: 'text', text: chunk.slice(lastIndex) });
+  }
+  if (parts.length === 0 && chunk) parts.push({ kind: 'text', text: chunk });
+  return parts;
+}

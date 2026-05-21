@@ -167,7 +167,20 @@ export const ActiveMsgStore = {
       let messages: ActiveMsg2InboxMessage[] = [];
       request.onsuccess = () => {
         messages = (request.result || []) as ActiveMsg2InboxMessage[];
-        messages.sort((a, b) => (a.sentAt || a.receivedAt) - (b.sentAt || b.receivedAt));
+        // amsg-instant 0.8.0-next.4 起一个 user turn 可能产 N 条 push (multi-chunk
+        // pushPayloads). FCM 投递不严格保序, 必须按 (sessionId, messageIndex) 排序
+        // 才能拿到正确气泡顺序. 没 sessionId 的 (老 worker / proactive push 等)
+        // 走 sentAt fallback 保持兼容.
+        messages.sort((a, b) => {
+          const aSess = a.metadata?.sessionId as string | undefined;
+          const bSess = b.metadata?.sessionId as string | undefined;
+          if (aSess && aSess === bSess) {
+            const aIdx = Number(a.metadata?.messageIndex ?? 0);
+            const bIdx = Number(b.metadata?.messageIndex ?? 0);
+            return aIdx - bIdx;
+          }
+          return (a.sentAt || a.receivedAt) - (b.sentAt || b.receivedAt);
+        });
         messages.forEach((m) => store.delete(m.messageId));
       };
       request.onerror = () => reject(request.error);

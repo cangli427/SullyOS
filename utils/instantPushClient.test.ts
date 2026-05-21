@@ -53,34 +53,17 @@ describe('sendInstantPush splitPattern injection', () => {
     } as any);
   });
 
-  it('H1 不带 splitPattern → 兜底注入 null', async () => {
+  it('next.4 不再注入 splitPattern, payload 直接 stringify', async () => {
     await sendInstantPush(basePayload());
     expect(fetch).toHaveBeenCalled();
     const callArgs = vi.mocked(fetch).mock.calls[0];
     const init = callArgs[1] as RequestInit;
     const body = JSON.parse(init.body as string);
-    expect(body.splitPattern).toBe(null);
+    // amsg-instant 0.8.0-next.4 起 splitPattern 字段被服务端拒收, 客户端也不再带
+    expect(body.splitPattern).toBeUndefined();
   });
 
-  it('H2 caller 显式给 splitPattern → 保留 (override 兜底)', async () => {
-    await sendInstantPush({ ...basePayload(), splitPattern: ['。', '！'] });
-    const body = JSON.parse(vi.mocked(fetch).mock.calls[0][1]!.body as string);
-    expect(body.splitPattern).toEqual(['。', '！']);
-  });
-
-  it('H3 caller 给 splitPattern: undefined → 兜底 null', async () => {
-    await sendInstantPush({ ...basePayload(), splitPattern: undefined });
-    const body = JSON.parse(vi.mocked(fetch).mock.calls[0][1]!.body as string);
-    expect(body.splitPattern).toBe(null);
-  });
-
-  it('caller 显式给 splitPattern: null → 保留 null', async () => {
-    await sendInstantPush({ ...basePayload(), splitPattern: null });
-    const body = JSON.parse(vi.mocked(fetch).mock.calls[0][1]!.body as string);
-    expect(body.splitPattern).toBe(null);
-  });
-
-  it('其他字段不受影响 (verify spread 没改 payload 形状)', async () => {
+  it('其他字段不受影响 (verify payload 形状没改)', async () => {
     await sendInstantPush(basePayload());
     const body = JSON.parse(vi.mocked(fetch).mock.calls[0][1]!.body as string);
     expect(body.contactName).toBe('TestChar');

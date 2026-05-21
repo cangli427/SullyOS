@@ -22,6 +22,7 @@ import {
 } from '@rei-standard/amsg-shared';
 
 import { classifyLLMOutput } from './classifier';
+import { sanitizeIntoSegments, type Segment } from '../../../utils/sanitize';
 
 export interface Env {
   VAPID_PUBLIC_KEY: string;
@@ -134,18 +135,28 @@ export interface PushDecisionDeps {
 }
 
 export type PushDecision =
-  | { decision: 'tool-request'; pushPayload: unknown }
-  | { decision: 'finish'; pushPayload: unknown };
+  | { decision: 'tool-request'; pushPayloads: unknown[] }
+  | { decision: 'finish'; pushPayloads: unknown[] }
+  | { decision: 'skip-push' };
 
 /**
- * 纯函数: 给 normalize 过的 ctx 字段, 出 { decision, pushPayload }.
+ * 纯函数: 给 normalize 过的 ctx 字段, 出 { decision, pushPayloads }.
  *
- * 跟 onLLMOutput 拆开就是为了能单测三条 push payload 路径 (tool-request 有
- * prefix / 空 prefix / finish 含 directives) + sanitize-空串 ZWSP 守护
- * (cumulative review 抓到过的回归点, 之前没自动化测试兜底).
+ * amsg-instant 0.8.0-next.4 起 hook 返回 pushPayloads 数组, lib 不做 split, hook
+ * 自己负责把内容切成 N 个独立 push. 我们用 sanitizeIntoSegments 把 LLM 输出
+ * 切成 segments (按换行 + CJK 空格切, 跟客户端 chatParser.chunkText 一致),
+ * 每个 segment 一条 push, banner 显示 sanitized 版本, message 保留 raw 让客户端
+ * Step 9/5/8 渲染.
  *
- * 注意: pushPayload 字段顺序对 wire 不重要, 但对单测断言重要 — 测试用
- * partial match (toEqual + objectContaining) 而不是 byte-for-byte JSON 比.
+ * 空输入 / sanitize 全 strip 完没剩内容时返 skip-push (没东西可发, lib 跳过这一轮).
+ *
+ * Tool-request: classifier 提取的 prefix 切 segments 当 content push, 再 append
+ * 一条 tool_request push 在末尾 (toolCalls 在那条上). decision 跟 push 内容
+ * messageKind 分布解耦, lib 不检查.
+ *
+ * Directives (副作用标签): finish 路径只在**最后一条** push 的 metadata 上挂,
+ * 防止客户端 N 条 inbox entry 都跑一次 replay (applyAssistantPostProcessing
+ * 这边也加了 messageIndex==totalMessages 守卫双保险).
  */
 export function buildPushDecision(
   input: PushDecisionInput,
@@ -154,79 +165,107 @@ export function buildPushDecision(
   const { llmOutputText, sessionId, iteration, contactName, avatarUrl, callerMetadata } = input;
 
   const result = classifyLLMOutput(llmOutputText);
-  const messageId = `msg_${sessionId}_${iteration}`;
   const baseCommon = {
     messageType: MESSAGE_TYPE.INSTANT,
     source: PUSH_SOURCE.INSTANT,
-    messageId,
     sessionId,
     contactName,
     avatarUrl,
   };
 
-  // notification.title 永远塞 — amsg-sw createNotificationFromPayload 没 title 时
-  // 会 fallback 到字面字符串 "New notification", 体验差. 用 `来自 X` 跟客户端
-  // saveContentToInbox 的 charName 一致. trim 兜底 contactName 全空白的边界情况.
   const trimmedContactName = (contactName || '').trim();
-  const notificationBase = { title: `来自 ${trimmedContactName || '主动消息'}` };
+  const notificationTitle = `来自 ${trimmedContactName || '主动消息'}`;
 
   if (result.kind === 'tool-request') {
-    // notification.body 条件塞: sanitize 真改了字符才塞, 没改则 amsg-sw fallback
-    // 到 payload.message — payload size 不翻倍. sanitize 把 body 净化成空串时
-    // (e.g. 只有 <think>) 用 zero-width-space 占位, 防 amsg-sw 的 `||` 短路
-    // 把 raw payload.message 漏到 OS banner.
-    const notification = result.sanitizedPrefix !== result.prefix
-      ? { ...notificationBase, body: result.sanitizedPrefix || '​' }
-      : notificationBase;
-    const pushPayload = {
+    // 把 prefix narration 切 segments. classifier 已经剥 DATA tag, prefix 里只
+    // 剩 narration 文字 (可能含 SEND_EMOJI / [html] 业务标签).
+    const narrationSegments = sanitizeIntoSegments(result.prefix);
+    const narrationPushes = narrationSegments.map((seg, i) =>
+      buildSegmentPush({ seg, baseCommon, notificationTitle, callerMetadata, iteration, chunkIdx: i, sessionId }),
+    );
+    // tool_request push 在末尾, message 空 (narration 已经独立成 push), toolCalls 在
+    // 这条上, 不带 notification → SW tool_request 分轨不弹 banner.
+    const toolPush = {
       ...buildToolRequestPush({
         ...baseCommon,
+        messageId: `msg_${sessionId}_${iteration}_toolreq`,
+        message: '',
         toolCalls: result.toolCalls,
-        // prefix 进 message 字段; SW tool_request 路由会把它写 inbox 让前置 narration 立刻显示.
-        // 可能为空串 (LLM 没说任何前置文本就直接吐数据标签), 那种情况下 SW 跳过 inbox 写入.
-        message: result.prefix,
         metadata: {
           ...callerMetadata,
-          // 客户端续跑时把 iteration + 1 重新发给 worker (见 amsg-instant /continue 契约).
           iteration,
         },
       }),
-      notification,
-      // splitPattern 统一在外层 request body 上禁 (见 instantPushClient.ts). next.3+
-      // 起 hook 这里也可以塞当 per-push override, 但 SullyOS 所有 push 都想要单条
-      // 不切的统一策略, 集中在客户端管更清晰. per-push 留给将来想做 per-message
-      // 切法的场景, 现在不用.
     };
-    warnIfPayloadLarge(pushPayload, deps?.onSizeWarn);
-    return { decision: 'tool-request', pushPayload };
+    const pushPayloads = [...narrationPushes, toolPush];
+    pushPayloads.forEach((p) => warnIfPayloadLarge(p, deps?.onSizeWarn));
+    return { decision: 'tool-request', pushPayloads };
   }
 
-  // result.kind === 'finish' — 同 tool-request 分支的 sanitize 空串 → ZWSP 占位逻辑
-  const notification = result.sanitizedBody !== result.cleanedText
-    ? { ...notificationBase, body: result.sanitizedBody || '​' }
-    : notificationBase;
-  const pushPayload = {
+  // finish
+  const segments = sanitizeIntoSegments(result.cleanedText);
+  if (segments.length === 0) {
+    // sanitize 全 strip 完没剩 (e.g. 整段只有 <think> 和业务标签). 没 banner / 没 bubble.
+    // directives 也无人挂载, 副作用就丢了 — 这是设计选择: 整段没用户可见内容就不发任何东西.
+    return { decision: 'skip-push' };
+  }
+  const lastIdx = segments.length - 1;
+  const pushPayloads = segments.map((seg, i) =>
+    buildSegmentPush({
+      seg,
+      baseCommon,
+      notificationTitle,
+      callerMetadata,
+      iteration,
+      chunkIdx: i,
+      sessionId,
+      // directives 只挂在最后一条 push 上, 客户端按 messageIndex==totalMessages 守卫
+      directives: i === lastIdx ? result.directives : undefined,
+    }),
+  );
+  pushPayloads.forEach((p) => warnIfPayloadLarge(p, deps?.onSizeWarn));
+  return { decision: 'finish', pushPayloads };
+}
+
+/**
+ * 单 segment → 单 ContentPush. messageId 显式给唯一值 ( amsg-shared typedef
+ * 要求, 不能 undefined ). next.4 lib runtime 看到 hook 已设 messageId 就不动,
+ * 只对未设的自动补 _chunk_${i} 后缀.
+ */
+function buildSegmentPush(args: {
+  seg: Segment;
+  baseCommon: {
+    messageType: typeof MESSAGE_TYPE.INSTANT;
+    source: typeof PUSH_SOURCE.INSTANT;
+    sessionId: string;
+    contactName: string;
+    avatarUrl: string | null;
+  };
+  notificationTitle: string;
+  callerMetadata: Record<string, unknown>;
+  iteration: number;
+  chunkIdx: number;
+  sessionId: string;
+  directives?: unknown[];
+}): unknown {
+  const { seg, baseCommon, notificationTitle, callerMetadata, iteration, chunkIdx, sessionId, directives } = args;
+  // notification.body 跟 message 显示文本可以不一样 (SEND_EMOJI 在 banner 上是
+  // [表情：x], 在 message 里是 [[SEND_EMOJI: x]] 让客户端 Step 9 渲染 sticker).
+  // 即使 sanitized === raw 也照样塞 — next.4 lib 不再 clone notification 跨 chunk,
+  // 每条独立, 不会重复占 size.
+  return {
     ...buildContentPush({
       ...baseCommon,
-      message: result.cleanedText,
-      // 1 索引 + 1 总数: SullyOS 客户端不依赖 worker 端分句, 而是由 applyAssistantPostProcessing
-      // 在 client 端按用户 splitPattern 分句保存到 DB. 这里送整段文本, 单 ContentPush.
-      messageIndex: 1,
-      totalMessages: 1,
+      messageId: `msg_${sessionId}_${iteration}_chunk_${chunkIdx}`,
+      message: seg.raw,
       metadata: {
         ...callerMetadata,
-        // directives = [] 时客户端 applyAssistantPostProcessing 仍走原文扫描路径 (兼容 worker
-        // 没分类成功 / 老 SW 落到本路径的场景). 非空时只重放, 不再扫.
-        directives: result.directives,
         iteration,
+        ...(directives !== undefined ? { directives } : {}),
       },
     }),
-    notification,
-    // splitPattern 禁用见上面分支同样的注释 — 客户端 instantPushClient 在 request
-    // body 外层注入, hook 这里不重复.
+    notification: { title: notificationTitle, body: seg.sanitized },
   };
-  warnIfPayloadLarge(pushPayload, deps?.onSizeWarn);
-  return { decision: 'finish', pushPayload };
 }
 
 /**

@@ -184,7 +184,11 @@ const processInboxMessageWithPostProcessing = async (message: ActiveMsg2InboxMes
     // 把 worker hook 塞进 metadata.directives 的副作用结构化重放出来 (POKE/TRANSFER/ADD_EVENT/
     // schedule_message/MUSIC_ACTION/XHS_*). applyAssistantPostProcessing 会反向拼回 tag 喂给
     // chatParser + 内联 XHS handler.
-    directives: extractDirectives(message),
+    // amsg-instant 0.8.0-next.4 起一个 user turn 可能产 N 条 push, directives 只应该
+    // replay 一次. worker buildPushDecision 把 directives 挂在最后一条 push 上,
+    // 这里加 isLastChunk 守卫双保险, 防未来 worker bug 在多条 push 都塞 directives.
+    // 老 worker (无 messageIndex/totalMessages 字段) ?? 0 fallback, 0===0 也算 last.
+    directives: isLastChunk(message) ? extractDirectives(message) : [],
     reasoningContent,
   });
 
@@ -195,6 +199,17 @@ const processInboxMessageWithPostProcessing = async (message: ActiveMsg2InboxMes
   // emotion eval 是 fire-and-forget). 失败只 log, 不抛.
   await runPushTailPipeline(message, char, userProfile, contextMsgs);
 };
+
+/**
+ * 这条 inbox message 是不是它所在 session 的**最后一条 chunk**.
+ * messageIndex == totalMessages → 最后一条 ✓
+ * 都缺失 (老 worker / proactive push 单 push) → 0 === 0 也认 last
+ */
+function isLastChunk(message: ActiveMsg2InboxMessage): boolean {
+  const mi = Number(message.metadata?.messageIndex ?? 0);
+  const tm = Number(message.metadata?.totalMessages ?? 0);
+  return mi === tm;
+}
 
 /** 把 worker 推给的 directives 从 inbox message metadata 里挖出来; 没有就空数组. */
 function extractDirectives(message: ActiveMsg2InboxMessage): PostProcessDirective[] {

@@ -206,31 +206,6 @@ function validateAvatarUrl(value) {
   }
   return null;
 }
-var SPLIT_PATTERN_MAX_LENGTH = 200;
-var SPLIT_PATTERN_MAX_ITEMS = 10;
-function validateSplitPattern(value) {
-  if (value === void 0 || value === null) return null;
-  const isArray = Array.isArray(value);
-  const items = isArray ? value : [value];
-  if (isArray && items.length === 0) return null;
-  if (items.length > SPLIT_PATTERN_MAX_ITEMS) {
-    return `splitPattern \u6570\u7EC4\u6700\u591A ${SPLIT_PATTERN_MAX_ITEMS} \u9879`;
-  }
-  for (let i = 0; i < items.length; i++) {
-    const s = items[i];
-    const label = isArray ? `splitPattern[${i}]` : "splitPattern";
-    if (typeof s !== "string") return `${label} \u5FC5\u987B\u662F\u5B57\u7B26\u4E32`;
-    if (s.length > SPLIT_PATTERN_MAX_LENGTH) {
-      return `${label} \u4E0D\u80FD\u8D85\u8FC7 ${SPLIT_PATTERN_MAX_LENGTH} \u5B57\u7B26`;
-    }
-    try {
-      new RegExp(s);
-    } catch (_) {
-      return `${label} \u4E0D\u662F\u6709\u6548\u6B63\u5219\u8868\u8FBE\u5F0F`;
-    }
-  }
-  return null;
-}
 function validateMessagesArray(messages) {
   if (!Array.isArray(messages) || messages.length === 0) {
     return "messages \u5FC5\u987B\u662F\u957F\u5EA6 \u2265 1 \u7684\u6570\u7EC4";
@@ -405,8 +380,15 @@ function validateInstantPayload(payload, opts) {
       details: { invalidFields: ["messageSubtype"] }
     };
   }
-  const splitErr = validatePerKindSplitPatterns(payload);
-  if (splitErr) return splitErr;
+  const removedField = ["splitPattern", "reasoningSplitPattern", "errorSplitPattern"].find((field) => payload[field] !== void 0);
+  if (removedField) {
+    return {
+      valid: false,
+      errorCode: "INVALID_PAYLOAD_FORMAT",
+      errorMessage: `${removedField} is removed in next.4; caller is responsible for splitting (return decision.pushPayloads with the exact pushes you want sent)`,
+      details: { invalidFields: [removedField] }
+    };
+  }
   const sharedErr = validateHookPathSharedFields(payload, opts);
   if (sharedErr) return sharedErr;
   return { valid: true };
@@ -513,24 +495,16 @@ function validateContinuePayload(payload, opts) {
     console.warn("[amsg-instant] /continue avatarUrl \u4E0D\u5408\u6CD5\uFF0C\u5DF2\u7F6E\u7A7A\uFF1A", avatarErr);
     payload.avatarUrl = null;
   }
-  const splitErr = validatePerKindSplitPatterns(payload);
-  if (splitErr) return splitErr;
-  return validateHookPathSharedFields(payload, opts) || { valid: true };
-}
-function validatePerKindSplitPatterns(payload) {
-  for (const field of ["splitPattern", "reasoningSplitPattern", "errorSplitPattern"]) {
-    const err = validateSplitPattern(payload[field]);
-    if (err) {
-      const labelled = field === "splitPattern" ? err : err.replace(/^splitPattern/, field);
-      return {
-        valid: false,
-        errorCode: "INVALID_PAYLOAD_FORMAT",
-        errorMessage: labelled,
-        details: { invalidFields: [field] }
-      };
-    }
+  const removedField = ["splitPattern", "reasoningSplitPattern", "errorSplitPattern"].find((field) => payload[field] !== void 0);
+  if (removedField) {
+    return {
+      valid: false,
+      errorCode: "INVALID_PAYLOAD_FORMAT",
+      errorMessage: `${removedField} is removed in next.4; caller is responsible for splitting (return decision.pushPayloads with the exact pushes you want sent)`,
+      details: { invalidFields: [removedField] }
+    };
   }
-  return null;
+  return validateHookPathSharedFields(payload, opts) || { valid: true };
 }
 function validateHookPathSharedFields(payload, opts) {
   if (payload.sessionId !== void 0) {
@@ -932,159 +906,55 @@ var DEFAULT_MAX_INLINE_BYTES = 2600;
 var DEFAULT_BLOB_TTL_SECONDS = 60;
 var VALID_DECISIONS = /* @__PURE__ */ new Set(["finish", "tool-request", "continue", "skip-push"]);
 var PUSH_PAYLOAD_BYTE_ENCODER = new TextEncoder();
-var DEFAULT_SPLIT_REGEX = /([。！？!?]+)/;
-function splitOnceByRegex(chunk, regex) {
-  const out = chunk.split(regex).reduce((acc, part, i, arr) => {
-    if (i % 2 === 0 && part.trim()) {
-      const punctuation = arr[i + 1] || "";
-      acc.push(part.trim() + punctuation);
+async function sendPushesSequentially(pushPayloads, payload, ctx, sessionId, sleep) {
+  const total = pushPayloads.length;
+  for (let i = 0; i < total; i++) {
+    const push = pushPayloads[i];
+    if (push.messageId === void 0) {
+      push.messageId = `msg_${randomUUID()}_chunk_${i}`;
     }
-    return acc;
-  }, []).filter((s) => s.length > 0);
-  return out.length > 0 ? out : [chunk];
-}
-function splitMessageIntoSentences(messageContent, splitPattern = null) {
-  const sources = splitPattern == null ? null : Array.isArray(splitPattern) ? splitPattern : [splitPattern];
-  const regexes = sources && sources.length > 0 ? sources.map((s) => new RegExp(s)) : [DEFAULT_SPLIT_REGEX];
-  let chunks = [messageContent];
-  for (const regex of regexes) {
-    chunks = chunks.flatMap((c) => splitOnceByRegex(c, regex));
-  }
-  return chunks.length > 0 ? chunks : [messageContent];
-}
-function pickSplitConfig(payload, kind, pushPattern, pushOverridePresent) {
-  const resolveDisabled = (pattern) => pattern === null || Array.isArray(pattern) && pattern.length === 0;
-  if (kind === "content" || kind === "tool_request") {
-    if (pushOverridePresent) {
-      return { textField: "message", pattern: pushPattern, disabled: resolveDisabled(pushPattern) };
+    push.messageIndex = i + 1;
+    push.totalMessages = total;
+    try {
+      await sendPushWithMaybeBlob(push, payload, ctx, sessionId);
+    } catch (err) {
+      if (err && (err.code === "HOOK_THREW" || err.code === "PAYLOAD_TOO_LARGE")) {
+        throw err;
+      }
+      const wrapped = new Error(err?.message || "Web Push delivery failed");
+      wrapped.code = "PUSH_SEND_FAILED";
+      wrapped.statusCode = err?.statusCode;
+      wrapped.messageIndex = i + 1;
+      wrapped.cause = err;
+      throw wrapped;
     }
-    const pattern = payload.splitPattern;
-    const disabled = pattern === null || Array.isArray(pattern) && pattern.length === 0;
-    return { textField: "message", pattern, disabled };
-  }
-  if (kind === "reasoning") {
-    if (pushOverridePresent) {
-      return { textField: "reasoningContent", pattern: pushPattern, disabled: resolveDisabled(pushPattern) };
-    }
-    const pattern = payload.reasoningSplitPattern;
-    const disabled = pattern === void 0 || pattern === null || Array.isArray(pattern) && pattern.length === 0;
-    return { textField: "reasoningContent", pattern, disabled };
-  }
-  if (kind === "error") {
-    if (pushOverridePresent) {
-      return { textField: "message", pattern: pushPattern, disabled: resolveDisabled(pushPattern) };
-    }
-    const pattern = payload.errorSplitPattern;
-    const disabled = pattern === void 0 || pattern === null || Array.isArray(pattern) && pattern.length === 0;
-    return { textField: "message", pattern, disabled };
-  }
-  return null;
-}
-function splitHookPushPayload(pushPayload, payload) {
-  if (!pushPayload || typeof pushPayload !== "object" || Array.isArray(pushPayload)) {
-    return [pushPayload];
-  }
-  const pushObj = (
-    /** @type {Record<string, unknown>} */
-    pushPayload
-  );
-  const kind = pushObj.messageKind;
-  const pushPattern = pushObj.splitPattern;
-  const pushOverridePresent = pushPattern !== void 0;
-  let cleanPushObj = pushObj;
-  if (pushOverridePresent) {
-    const validationErr = validateSplitPattern(pushPattern);
-    if (validationErr) {
-      const cleanedErr = validationErr.replace(
-        /^splitPattern(\[\d+\])?\s*/,
-        (_m, idx) => idx ? `${idx} ` : ""
-      );
-      throw new HookError(`pushPayload.splitPattern invalid: ${cleanedErr}`);
-    }
-    const { splitPattern: _strip, ...rest } = pushObj;
-    cleanPushObj = rest;
-  }
-  const cfg = pickSplitConfig(payload || {}, kind, pushPattern, pushOverridePresent);
-  if (!cfg || cfg.disabled) return [cleanPushObj];
-  const text = cleanPushObj[cfg.textField];
-  if (typeof text !== "string" || text.length === 0) return [cleanPushObj];
-  const segments = splitMessageIntoSentences(text, cfg.pattern);
-  if (segments.length <= 1) return [cleanPushObj];
-  const total = segments.length;
-  return segments.map((segment, i) => {
-    const isLast = i === total - 1;
-    const chunkMessageId = `msg_${randomUUID()}_chunk_${i}`;
-    if (kind === "tool_request" && !isLast) {
-      const { toolCalls: _drop, ...rest } = cleanPushObj;
-      return {
-        ...rest,
-        messageKind: "content",
-        messageId: chunkMessageId,
-        message: segment,
-        messageIndex: i + 1,
-        totalMessages: total
-      };
-    }
-    return {
-      ...cleanPushObj,
-      messageId: chunkMessageId,
-      [cfg.textField]: segment,
-      messageIndex: i + 1,
-      totalMessages: total
-    };
-  });
-}
-async function sendChunkedPush(pushPayload, payload, ctx, sessionId, sleep) {
-  const chunks = splitHookPushPayload(pushPayload, payload);
-  for (let i = 0; i < chunks.length; i++) {
-    await sendPushWithMaybeBlob(chunks[i], payload, ctx, sessionId);
-    if (i < chunks.length - 1) {
+    if (i < total - 1) {
       await sleep(SLEEP_BETWEEN_MESSAGES_MS);
     }
   }
-  return chunks.length;
+  return total;
 }
-function expandReasoningPushChunks(reasoningPush, payload, reasoningChunkBytes, iteration) {
-  const layer1 = splitHookPushPayload(reasoningPush, payload);
-  if (reasoningChunkBytes === null) return layer1;
+function sliceReasoningPush(reasoningPush, reasoningChunkBytes, iteration) {
+  if (reasoningChunkBytes === null) return [reasoningPush];
   const threshold = Number.isInteger(reasoningChunkBytes) && reasoningChunkBytes >= 4 ? reasoningChunkBytes : DEFAULT_REASONING_CHUNK_BYTES;
-  const out = [];
-  for (const segment of layer1) {
-    const text = segment && typeof segment === "object" ? (
-      /** @type {{reasoningContent?: unknown}} */
-      segment.reasoningContent
-    ) : void 0;
-    if (typeof text !== "string" || text.length === 0) {
-      out.push(segment);
-      continue;
-    }
-    const byteLen = PUSH_PAYLOAD_BYTE_ENCODER.encode(text).byteLength;
-    if (byteLen <= threshold) {
-      out.push(segment);
-      continue;
-    }
-    const pieces = chunkReasoningByUtf8Bytes(text, threshold);
-    const totalChunks = pieces.length;
-    const iterTag = Number.isInteger(iteration) ? iteration : 0;
-    for (let i = 0; i < totalChunks; i++) {
-      out.push({
-        ...segment,
-        messageId: `msg_${randomUUID()}_iter_${iterTag}_reasoning_chunk_${i + 1}`,
-        reasoningContent: pieces[i],
-        chunkIndex: i + 1,
-        totalChunks
-      });
-    }
-  }
-  return out;
+  const text = typeof reasoningPush.reasoningContent === "string" ? reasoningPush.reasoningContent : "";
+  if (!text) return [reasoningPush];
+  const byteLen = PUSH_PAYLOAD_BYTE_ENCODER.encode(text).byteLength;
+  if (byteLen <= threshold) return [reasoningPush];
+  const pieces = chunkReasoningByUtf8Bytes(text, threshold);
+  const totalChunks = pieces.length;
+  const iterTag = Number.isInteger(iteration) ? iteration : 0;
+  return pieces.map((piece, i) => ({
+    ...reasoningPush,
+    messageId: `msg_${randomUUID()}_iter_${iterTag}_reasoning_chunk_${i + 1}`,
+    reasoningContent: piece,
+    chunkIndex: i + 1,
+    totalChunks
+  }));
 }
 async function emitReasoning(reasoningPush, payload, ctx, sessionId, sleep, iteration) {
-  const leaves = expandReasoningPushChunks(reasoningPush, payload, ctx.reasoningChunkBytes, iteration);
-  const byteChunked = leaves.some(
-    (l) => l && typeof l === "object" && /** @type {{totalChunks?: unknown}} */
-    l.totalChunks !== void 0
-  );
-  if (byteChunked) {
+  const leaves = sliceReasoningPush(reasoningPush, ctx.reasoningChunkBytes, iteration);
+  if (leaves.length > 1) {
     const onEvent = typeof ctx.onEvent === "function" ? ctx.onEvent : () => {
     };
     const totalBytes = typeof reasoningPush.reasoningContent === "string" ? PUSH_PAYLOAD_BYTE_ENCODER.encode(reasoningPush.reasoningContent).byteLength : 0;
@@ -1095,18 +965,7 @@ async function emitReasoning(reasoningPush, payload, ctx, sessionId, sleep, iter
   for (let i = 0; i < leaves.length; i++) {
     await sendPushWithMaybeBlob(leaves[i], payload, ctx, sessionId);
     if (i < leaves.length - 1) {
-      const cur = leaves[i];
-      const next = leaves[i + 1];
-      const curIdx = cur && typeof cur === "object" ? (
-        /** @type {{messageIndex?: unknown}} */
-        cur.messageIndex
-      ) : void 0;
-      const nextIdx = next && typeof next === "object" ? (
-        /** @type {{messageIndex?: unknown}} */
-        next.messageIndex
-      ) : void 0;
-      const sameSegment = curIdx === nextIdx;
-      await sleep(sameSegment ? SLEEP_BETWEEN_REASONING_CHUNKS_MS : SLEEP_BETWEEN_MESSAGES_MS);
+      await sleep(SLEEP_BETWEEN_REASONING_CHUNKS_MS);
     }
   }
   return leaves.length;
@@ -1268,7 +1127,11 @@ async function runLegacyInstant(payload, ctx) {
       await sleep(SLEEP_BETWEEN_MESSAGES_MS);
     }
   }
-  const messages = splitMessageIntoSentences(messageContent, payload.splitPattern ?? null);
+  const splitOutput = messageContent.split(/([。！？!?]+)/).reduce((acc, part, i, arr) => {
+    if (i % 2 === 0 && part.trim()) acc.push(part.trim() + (arr[i + 1] || ""));
+    return acc;
+  }, []).filter((s) => s.length > 0);
+  const messages = splitOutput.length > 0 ? splitOutput : [messageContent];
   for (let i = 0; i < messages.length; i++) {
     const contentPush = buildContentPush({
       messageType: "instant",
@@ -1412,9 +1275,13 @@ async function runAgenticLoop(payload, ctx) {
     if (decision.decision === "skip-push") {
       return { status: "skipped", sessionId, iteration };
     }
-    const isReasoning = decision.pushPayload && typeof decision.pushPayload === "object" && /** @type {{messageKind?: unknown}} */
-    decision.pushPayload.messageKind === "reasoning";
-    const messagesSent = isReasoning ? await emitReasoning(decision.pushPayload, payload, ctx, sessionId, sleep, iteration) : await sendChunkedPush(decision.pushPayload, payload, ctx, sessionId, sleep);
+    const messagesSent = await sendPushesSequentially(
+      decision.pushPayloads,
+      payload,
+      ctx,
+      sessionId,
+      sleep
+    );
     onEvent({
       type: decision.decision === "finish" ? "final_pushed" : "tool_request_pushed",
       sessionId,
@@ -1435,7 +1302,7 @@ async function runAgenticLoop(payload, ctx) {
     timestamp: (/* @__PURE__ */ new Date()).toISOString()
   });
   try {
-    await sendChunkedPush(diagnostic, payload, ctx, sessionId, sleep);
+    await sendPushWithMaybeBlob(diagnostic, payload, ctx, sessionId);
   } catch (err) {
     onEvent({ type: "diagnostic_push_failed", code: "LOOP_EXCEEDED", sessionId, cause: err });
   }
@@ -1452,15 +1319,52 @@ function assertValidDecision(decision) {
   if (typeof tag !== "string" || !VALID_DECISIONS.has(tag)) {
     throw new TypeError(`onLLMOutput returned invalid decision tag: ${stringifyForError(tag)}`);
   }
-  if (tag === "continue" && !Array.isArray(
-    /** @type {{ nextHistory?: unknown }} */
-    decision.nextHistory
-  )) {
-    throw new TypeError('decision:"continue" requires a nextHistory array');
+  const hasSingular = Object.prototype.hasOwnProperty.call(decision, "pushPayload");
+  const hasPlural = Object.prototype.hasOwnProperty.call(decision, "pushPayloads");
+  if (hasSingular) {
+    throw new TypeError(
+      hasPlural ? "pushPayload (singular) is removed in next.4, use pushPayloads" : "pushPayload (singular) is removed in next.4, use pushPayloads: [yourPayload]"
+    );
   }
-  if ((tag === "finish" || tag === "tool-request") && /** @type {{ pushPayload?: unknown }} */
-  decision.pushPayload === void 0) {
-    throw new TypeError(`decision:"${tag}" requires a pushPayload`);
+  if (tag === "continue") {
+    if (!Array.isArray(
+      /** @type {{ nextHistory?: unknown }} */
+      decision.nextHistory
+    )) {
+      throw new TypeError('decision:"continue" requires a nextHistory array');
+    }
+    return;
+  }
+  if (tag === "skip-push") {
+    return;
+  }
+  if (!hasPlural || !Array.isArray(
+    /** @type {{ pushPayloads?: unknown }} */
+    decision.pushPayloads
+  )) {
+    throw new TypeError(`decision:"${tag}" requires a pushPayloads array`);
+  }
+  const pushes = (
+    /** @type {Array<unknown>} */
+    decision.pushPayloads
+  );
+  if (pushes.length === 0) {
+    throw new TypeError("pushPayloads: [] \u2014 use decision: skip-push to skip notification entirely");
+  }
+  for (let i = 0; i < pushes.length; i++) {
+    const p = pushes[i];
+    if (!p || typeof p !== "object" || Array.isArray(p)) {
+      throw new TypeError(`pushPayloads[${i}] must be a plain object, got ${stringifyForError(p)}`);
+    }
+    if (Object.prototype.hasOwnProperty.call(p, "splitPattern")) {
+      throw new TypeError(`pushPayloads[${i}].splitPattern is removed in next.4; caller is responsible for splitting`);
+    }
+    if (Object.prototype.hasOwnProperty.call(p, "messageId")) {
+      const id = p.messageId;
+      if (typeof id !== "string" || id === "") {
+        throw new TypeError(`pushPayloads[${i}].messageId must be a non-empty string when set, got ${stringifyForError(id)}`);
+      }
+    }
   }
 }
 function stringifyForError(value) {
@@ -1954,6 +1858,80 @@ function sanitizeForNotification(text) {
   result = collapseWhitespace(result);
   return result;
 }
+function sanitizeIntoSegments(text) {
+  let cleaned = stripLiteralBackslashN(text);
+  cleaned = stripThinkBlocks(cleaned);
+  cleaned = extractTranslationOriginal(cleaned);
+  cleaned = stripInnerState(cleaned);
+  cleaned = stripBusinessTagsForNotification(cleaned);
+  cleaned = stripTimestamps(cleaned);
+  cleaned = stripChineseDate(cleaned);
+  cleaned = stripRoleNamePrefix(cleaned);
+  cleaned = stripSourceTags(cleaned);
+  cleaned = stripQuotes(cleaned);
+  cleaned = stripLegacyTrans(cleaned);
+  cleaned = stripMarkdownDividers(cleaned);
+  const rawChunks = chunkText(cleaned);
+  const segments = [];
+  for (const rawChunk of rawChunks) {
+    const parts = splitOnSendEmoji(rawChunk);
+    for (const part of parts) {
+      if (part.kind === "emoji") {
+        segments.push({
+          raw: `[[SEND_EMOJI: ${part.name}]]`,
+          sanitized: `[\u8868\u60C5\uFF1A${part.name}]`
+        });
+        continue;
+      }
+      const rawText = part.text.trim();
+      if (!rawText) continue;
+      const sanitized = sanitizeTextForBanner(rawText).trim();
+      if (!sanitized) continue;
+      segments.push({ raw: rawText, sanitized });
+    }
+  }
+  return segments;
+}
+function sanitizeTextForBanner(text) {
+  let result = text;
+  result = replaceHtmlBlocks(result);
+  result = replaceEmojiReverseTag(result);
+  result = replaceMarkdownLinks(result);
+  result = stripMarkdownHeaders(result);
+  result = stripMarkdownBold(result);
+  result = stripBackticks(result);
+  result = collapseWhitespace(result);
+  return result;
+}
+function chunkText(text) {
+  const CJK = "\\u4e00-\\u9fff\\u3400-\\u4dbf\\u3000-\\u303f\\uff00-\\uffef\\u2000-\\u206f\\u2e80-\\u2eff\\u3001-\\u3003\\u2018-\\u201f\\u300a-\\u300f\\uff01-\\uff0f\\uff1a-\\uff20";
+  const cjkSpaceRe = new RegExp(`(?<=[${CJK}])\\s+(?=[${CJK}])`);
+  const lineChunks = text.split(/(?:\r\n|\r|\n|\u2028|\u2029)+/).map((c) => c.trim()).filter((c) => c.length > 0);
+  const out = [];
+  for (const chunk of lineChunks) {
+    const sub = chunk.split(cjkSpaceRe).map((c) => c.trim()).filter((c) => c.length > 0);
+    out.push(...sub);
+  }
+  return out;
+}
+function splitOnSendEmoji(chunk) {
+  const re = /\[\[SEND_EMOJI:\s*(.*?)\]\]/g;
+  const parts = [];
+  let lastIndex = 0;
+  let m;
+  while ((m = re.exec(chunk)) !== null) {
+    if (m.index > lastIndex) {
+      parts.push({ kind: "text", text: chunk.slice(lastIndex, m.index) });
+    }
+    parts.push({ kind: "emoji", name: m[1].trim() });
+    lastIndex = m.index + m[0].length;
+  }
+  if (lastIndex < chunk.length) {
+    parts.push({ kind: "text", text: chunk.slice(lastIndex) });
+  }
+  if (parts.length === 0 && chunk) parts.push({ kind: "text", text: chunk });
+  return parts;
+}
 
 // worker/instant-push/src/classifier.ts
 var DATA_TAGS = [
@@ -2168,64 +2146,72 @@ async function onLLMOutput(ctx) {
 function buildPushDecision(input, deps) {
   const { llmOutputText, sessionId, iteration, contactName, avatarUrl, callerMetadata } = input;
   const result = classifyLLMOutput(llmOutputText);
-  const messageId = `msg_${sessionId}_${iteration}`;
   const baseCommon = {
     messageType: MESSAGE_TYPE.INSTANT,
     source: PUSH_SOURCE.INSTANT,
-    messageId,
     sessionId,
     contactName,
     avatarUrl
   };
   const trimmedContactName = (contactName || "").trim();
-  const notificationBase = { title: `\u6765\u81EA ${trimmedContactName || "\u4E3B\u52A8\u6D88\u606F"}` };
+  const notificationTitle = `\u6765\u81EA ${trimmedContactName || "\u4E3B\u52A8\u6D88\u606F"}`;
   if (result.kind === "tool-request") {
-    const notification2 = result.sanitizedPrefix !== result.prefix ? { ...notificationBase, body: result.sanitizedPrefix || "\u200B" } : notificationBase;
-    const pushPayload2 = {
+    const narrationSegments = sanitizeIntoSegments(result.prefix);
+    const narrationPushes = narrationSegments.map(
+      (seg, i) => buildSegmentPush({ seg, baseCommon, notificationTitle, callerMetadata, iteration, chunkIdx: i, sessionId })
+    );
+    const toolPush = {
       ...buildToolRequestPush({
         ...baseCommon,
+        messageId: `msg_${sessionId}_${iteration}_toolreq`,
+        message: "",
         toolCalls: result.toolCalls,
-        // prefix 进 message 字段; SW tool_request 路由会把它写 inbox 让前置 narration 立刻显示.
-        // 可能为空串 (LLM 没说任何前置文本就直接吐数据标签), 那种情况下 SW 跳过 inbox 写入.
-        message: result.prefix,
         metadata: {
           ...callerMetadata,
-          // 客户端续跑时把 iteration + 1 重新发给 worker (见 amsg-instant /continue 契约).
           iteration
         }
-      }),
-      notification: notification2
-      // splitPattern 统一在外层 request body 上禁 (见 instantPushClient.ts). next.3+
-      // 起 hook 这里也可以塞当 per-push override, 但 SullyOS 所有 push 都想要单条
-      // 不切的统一策略, 集中在客户端管更清晰. per-push 留给将来想做 per-message
-      // 切法的场景, 现在不用.
+      })
     };
-    warnIfPayloadLarge(pushPayload2, deps?.onSizeWarn);
-    return { decision: "tool-request", pushPayload: pushPayload2 };
+    const pushPayloads2 = [...narrationPushes, toolPush];
+    pushPayloads2.forEach((p) => warnIfPayloadLarge(p, deps?.onSizeWarn));
+    return { decision: "tool-request", pushPayloads: pushPayloads2 };
   }
-  const notification = result.sanitizedBody !== result.cleanedText ? { ...notificationBase, body: result.sanitizedBody || "\u200B" } : notificationBase;
-  const pushPayload = {
+  const segments = sanitizeIntoSegments(result.cleanedText);
+  if (segments.length === 0) {
+    return { decision: "skip-push" };
+  }
+  const lastIdx = segments.length - 1;
+  const pushPayloads = segments.map(
+    (seg, i) => buildSegmentPush({
+      seg,
+      baseCommon,
+      notificationTitle,
+      callerMetadata,
+      iteration,
+      chunkIdx: i,
+      sessionId,
+      // directives 只挂在最后一条 push 上, 客户端按 messageIndex==totalMessages 守卫
+      directives: i === lastIdx ? result.directives : void 0
+    })
+  );
+  pushPayloads.forEach((p) => warnIfPayloadLarge(p, deps?.onSizeWarn));
+  return { decision: "finish", pushPayloads };
+}
+function buildSegmentPush(args) {
+  const { seg, baseCommon, notificationTitle, callerMetadata, iteration, chunkIdx, sessionId, directives } = args;
+  return {
     ...buildContentPush({
       ...baseCommon,
-      message: result.cleanedText,
-      // 1 索引 + 1 总数: SullyOS 客户端不依赖 worker 端分句, 而是由 applyAssistantPostProcessing
-      // 在 client 端按用户 splitPattern 分句保存到 DB. 这里送整段文本, 单 ContentPush.
-      messageIndex: 1,
-      totalMessages: 1,
+      messageId: `msg_${sessionId}_${iteration}_chunk_${chunkIdx}`,
+      message: seg.raw,
       metadata: {
         ...callerMetadata,
-        // directives = [] 时客户端 applyAssistantPostProcessing 仍走原文扫描路径 (兼容 worker
-        // 没分类成功 / 老 SW 落到本路径的场景). 非空时只重放, 不再扫.
-        directives: result.directives,
-        iteration
+        iteration,
+        ...directives !== void 0 ? { directives } : {}
       }
     }),
-    notification
-    // splitPattern 禁用见上面分支同样的注释 — 客户端 instantPushClient 在 request
-    // body 外层注入, hook 这里不重复.
+    notification: { title: notificationTitle, body: seg.sanitized }
   };
-  warnIfPayloadLarge(pushPayload, deps?.onSizeWarn);
-  return { decision: "finish", pushPayload };
 }
 function warnIfPayloadLarge(payload, onSizeWarn) {
   try {
