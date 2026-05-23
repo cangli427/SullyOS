@@ -35,7 +35,7 @@ import { installReiSW } from '@rei-standard/amsg-sw';
  *  - 1.8.0: 新增 emotion_update push 分轨 (saveEmotionUpdateToInbox). worker 端跑完副 API 情绪
  *           评估后把 buff 结果推回, 静默写 inbox (不弹通知/不计未读), 客户端 flush 时落 buff.
  */
-const SW_VERSION = '1.8.0';
+const SW_VERSION = '1.8.1';
 
 const PING_INTERVAL = 15_000;
 const MAX_MANUAL_ALIVE_MS = 5 * 60_000;
@@ -399,8 +399,10 @@ async function notifyVisibleClientForToolRequest(payload: any) {
 // 后台时 postMessage 排队/丢弃, 回前台 visibilitychange flush 兜底).
 async function saveEmotionUpdateToInbox(payload: any) {
   const charId = payload?.metadata?.charId;
-  const emotionRaw = payload?.metadata?.emotionRaw;
-  if (!charId || !emotionRaw) return;
+  // emotionRaw 允许为空: worker 评估失败/返回空时也会推一条 "done" 信号 (emotionRaw=''),
+  // 仍需写 inbox + notify, 让客户端 flush 时 fire 'instant-emotion-done' 熄灭 "情绪分析中" 徽章.
+  const emotionRaw = payload?.metadata?.emotionRaw || '';
+  if (!charId) return;
   const messageId = String(payload?.messageId || `${charId}-emotion-${Date.now()}`);
 
   const db = await openInboxDb();

@@ -707,7 +707,7 @@ export const useChatAI = ({
                 instantEmotionTimerRef.current = setTimeout(() => {
                     setEmotionStatus('');
                     instantEmotionTimerRef.current = null;
-                }, 150_000);
+                }, 90_000);  // 安全网: 正常情况下 worker 推回 emotion_update 会 fire 'instant-emotion-done' 提前熄灭; 只在 worker 被杀/推送丢失时兜底.
             }
 
             // 发送前汇总计时

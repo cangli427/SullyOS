@@ -147,14 +147,16 @@ async function runEmotionEval(body: any, env: Env): Promise<void> {
         stream: false,
       }),
     });
-    if (!res.ok) {
+    let raw = '';
+    if (res.ok) {
+      const data: any = await res.json();
+      raw = data?.choices?.[0]?.message?.content || '';
+    } else {
       console.error('[emotion-eval] LLM call failed', res.status);
-      return;
     }
-    const data: any = await res.json();
-    const raw = data?.choices?.[0]?.message?.content || '';
-    if (!raw) return;
 
+    // 无论成功 / 失败 / 空结果都推一条 emotion_update (emotionRaw 可能为空字符串):
+    // 客户端据此熄灭 "情绪分析中" 徽章, 否则只能等本地安全超时, 体验上像卡死.
     const pushObj = {
       messageKind: 'emotion_update',
       messageType: MESSAGE_TYPE.INSTANT,
@@ -197,11 +199,13 @@ export default {
     } catch {
       body = null; // 非 JSON / 解析失败: 不影响主路径
     }
-    const response = await (cfWorker as any).fetch(request, env, ctx);
-    if (body?.emotionEval && response && response.status >= 200 && response.status < 300) {
+    // 情绪评估不依赖主回复内容 (用 body.messages = 与主回复同一批消息, 跟本地一样不含新回复),
+    // 所以与主回复**并行**跑, 而不是 await cfWorker.fetch (流式输出 + 推送 + 收尾可能拖 ~30s)
+    // 完成后才启动 —— 砍掉情绪评估的启动延迟, 让 buff / "情绪分析中" 徽章尽快结算.
+    if (body?.emotionEval) {
       ctx.waitUntil(runEmotionEval(body, env));
     }
-    return response;
+    return await (cfWorker as any).fetch(request, env, ctx);
   },
   async scheduled(_event: unknown, env: Env) {
     if (!env.DB) return;

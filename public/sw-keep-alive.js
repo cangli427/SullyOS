@@ -302,7 +302,7 @@ async function removeQueuedRequest(id) {
 }
 
 // worker/sw-keep-alive.ts
-var SW_VERSION = "1.8.0";
+var SW_VERSION = "1.8.1";
 var PING_INTERVAL = 15e3;
 var MAX_MANUAL_ALIVE_MS = 5 * 6e4;
 var ACTIVE_MSG_DB_NAME = "ActiveMsg";
@@ -573,8 +573,8 @@ async function notifyVisibleClientForToolRequest(payload) {
 }
 async function saveEmotionUpdateToInbox(payload) {
   const charId = payload?.metadata?.charId;
-  const emotionRaw = payload?.metadata?.emotionRaw;
-  if (!charId || !emotionRaw) return;
+  const emotionRaw = payload?.metadata?.emotionRaw || "";
+  if (!charId) return;
   const messageId = String(payload?.messageId || `${charId}-emotion-${Date.now()}`);
   const db = await openInboxDb();
   await new Promise((resolve, reject) => {

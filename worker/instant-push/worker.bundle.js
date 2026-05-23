@@ -2476,13 +2476,13 @@ async function runEmotionEval(body, env) {
         stream: false
       })
     });
-    if (!res.ok) {
+    let raw = "";
+    if (res.ok) {
+      const data = await res.json();
+      raw = data?.choices?.[0]?.message?.content || "";
+    } else {
       console.error("[emotion-eval] LLM call failed", res.status);
-      return;
     }
-    const data = await res.json();
-    const raw = data?.choices?.[0]?.message?.content || "";
-    if (!raw) return;
     const pushObj = {
       messageKind: "emotion_update",
       messageType: MESSAGE_TYPE.INSTANT,
@@ -2515,11 +2515,10 @@ var src_default = {
     } catch {
       body = null;
     }
-    const response = await cfWorker.fetch(request, env, ctx);
-    if (body?.emotionEval && response && response.status >= 200 && response.status < 300) {
+    if (body?.emotionEval) {
       ctx.waitUntil(runEmotionEval(body, env));
     }
-    return response;
+    return await cfWorker.fetch(request, env, ctx);
   },
   async scheduled(_event, env) {
     if (!env.DB) return;
