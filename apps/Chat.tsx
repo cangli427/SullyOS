@@ -24,9 +24,6 @@ import { isInstantConfigReady, loadInstantConfig } from '../utils/instantPushCli
 
 const VOICE_LANG_LABELS: Record<string, string> = { en: 'English', ja: '日本語', ko: '한국어', fr: 'Français', es: 'Español' };
 
-// 稳定的空 Set 引用, 给 instantPendingUserIds 派生用 (避免每次渲染新建空 Set 触发下游 memo).
-const EMPTY_NUM_SET: ReadonlySet<number> = new Set<number>();
-
 const Chat: React.FC = () => {
     const { characters, activeCharacterId, setActiveCharacterId, updateCharacter, apiConfig, apiPresets, addApiPreset, closeApp, customThemes, removeCustomTheme, addToast, showError, userProfile, lastMsgTimestamp, groups, clearUnread, realtimeConfig, memoryPalaceConfig, syncEmotionApiToAllCharacters, theme: osTheme, proactiveComposingChars } = useOS();
     const isProactiveComposing = !!(activeCharacterId && proactiveComposingChars[activeCharacterId]);
@@ -828,9 +825,8 @@ const Chat: React.FC = () => {
     // 与 autoTriggerOnSend 自动路径的指示器行为一致。本地模式无此指示器，直接 triggerAI。
     const handleManualTrigger = () => {
         if (!isInstantConfigReady()) { triggerAI(messages); return; }
-        // 本地模式无此指示器, 直接 triggerAI; instant 模式置 instantSendingActive=true,
-        // 三个点由 instantSendingUserIds 派生 (按当前 messages 重算尾部 user 消息), POST 发出
-        // (onInstantPosted) 后置 false 清除. 不再快照消息 id, 避免点击瞬间 messages 未更新导致漏显示.
+        // instantSendingActive 驱动 header "发送中…" 徽章 (拼接+发送窗口). 消息上的三个小圆点
+        // 另走纯前端判定 (isTyping && 最后一条消息), 见渲染处.
         setInstantSendingActive(true);
         triggerAI(messages, undefined, () => setInstantSendingActive(false));
     };
@@ -1830,22 +1826,6 @@ const Chat: React.FC = () => {
 
     const collapsedCount = Math.max(0, totalMsgCount - displayMessages.length);
 
-    // "准备中"三个点 = "消息正在拼接 + 发送" 的可见信号; 消失 = 已 POST 发出 (带 keepalive,
-    // 杀 PWA 也安全) → 用户可安全离开. 语义必须是 "触发 → POST dispatch" 这一窗口.
-    // 用显式布尔 instantSendingActive (handleManualTrigger / 自动发送路径置 true, onInstantPosted
-    // = onDispatched 置 false), 派生时按当前 messages 重算 "上一条 assistant 之后的所有 user 消息"
-    // —— 不依赖点击瞬间快照 (旧实现快照 trailingUserIds / savedUserMsgId, 易因 messages 未及时
-    // 更新或竞态而集合为空, 实测根本不显示). 每次渲染按最新 messages 算, 鲁棒可见.
-    const instantSendingUserIds = useMemo(() => {
-        if (!instantSendingActive) return EMPTY_NUM_SET;
-        const ids = new Set<number>();
-        for (let i = messages.length - 1; i >= 0; i--) {
-            if (messages[i].role === 'assistant') break;
-            if (messages[i].role === 'user') ids.add(messages[i].id);
-        }
-        return ids;
-    }, [instantSendingActive, messages]);
-
     // Reset active category if it becomes invisible for the current character
     useEffect(() => {
         if (activeCategory !== 'default' && visibleCategories.length > 0 && !visibleCategories.some(c => c.id === activeCategory)) {
@@ -2351,7 +2331,7 @@ const Chat: React.FC = () => {
                             bubbleVariant={osTheme.chatBubbleStyle}
                             messageSpacing={osTheme.chatMessageSpacing}
                             showTimestamp={osTheme.chatShowTimestamp}
-                            isPending={instantSendingUserIds.has(m.id)}
+                            isPending={isTyping && i === displayMessages.length - 1}
                             pendingIndicator={osTheme.chatPendingIndicator !== false}
                             onMcdSendCart={handleMcdSendCart}
                             onMcdCandidate={handleMcdCandidate}
