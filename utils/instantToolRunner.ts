@@ -125,6 +125,20 @@ async function runOnePendingToolCall(item: InstantPushPendingToolCall): Promise<
     });
   }
 
+  // 把这一轮 XHS 工具抓到的笔记 + xsecToken 落库 (按 sessionId). round 2 worker 发回
+  // [[XHS_SHARE: 序号]] / 评论 / 点赞 时, applyAssistantPostProcessing 要靠这份笔记取卡片;
+  // 内存单例 pushLastXhsNotesRef 跨 SW 唤醒 / 页面回收会清空, 不持久化就会静默掉卡片.
+  if (pushLastXhsNotesRef.current.length > 0) {
+    try {
+      await ActiveMsgStore.saveXhsSessionNotes(item.sessionId, {
+        notes: pushLastXhsNotesRef.current,
+        xsecTokens: Array.from(pushXhsCaches.xsecTokenCache.entries()),
+      });
+    } catch (e) {
+      console.warn('[instant-tool-runner] persist xhs notes failed', item.sessionId, e);
+    }
+  }
+
   // 2. 拼下一轮 LLM 看到的 messages: outbound history + assistant tool_call message + tool results.
   //    这是 OpenAI tool-call 协议的标准形状; worker 拿到后会直接转发给 LLM.
   const assistantMsg = {

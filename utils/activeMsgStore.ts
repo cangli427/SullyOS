@@ -84,6 +84,44 @@ const setKv = async <T>(id: string, value: T): Promise<void> => {
   });
 };
 
+// XHS 跨轮笔记缓冲: round 1 工具跑完写, round 2 [[XHS_SHARE]]/评论/点赞 重放时读.
+// 存在 KV 是因为内存单例 (pushLastXhsNotesRef) 跨 SW 唤醒 / 页面回收会清空 —— 移动端
+// instant 流程的 round 1 与 round 2 之间常隔一次后台重载, 笔记一丢 XHS_SHARE 就静默掉卡片.
+const XHS_SESSION_NOTES_PREFIX = 'xhs_session_notes:';
+const XHS_SESSION_NOTES_TTL_MS = 3 * 60 * 60 * 1000;
+
+export type XhsSessionNotes = {
+  notes: unknown[];
+  xsecTokens: Array<[string, string]>;
+  savedAt: number;
+};
+
+// 写入时顺手清理过期条目, 防 KV 无界增长 (outbound_sessions 本身也没清理, 这里不重蹈覆辙).
+const pruneStaleXhsSessionNotes = async (): Promise<void> => {
+  try {
+    const db = await openDB();
+    await new Promise<void>((resolve) => {
+      const tx = db.transaction(STORE_KV, 'readwrite');
+      const store = tx.objectStore(STORE_KV);
+      const cutoff = Date.now() - XHS_SESSION_NOTES_TTL_MS;
+      const req = store.openCursor();
+      req.onsuccess = () => {
+        const cursor = req.result;
+        if (!cursor) return;
+        const rec = cursor.value as KvRecord<{ savedAt?: number }> | undefined;
+        if (rec && typeof rec.id === 'string' && rec.id.startsWith(XHS_SESSION_NOTES_PREFIX)) {
+          const savedAt = Number(rec.value?.savedAt ?? 0);
+          if (savedAt < cutoff) cursor.delete();
+        }
+        cursor.continue();
+      };
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => resolve();
+      tx.onabort = () => resolve();
+    });
+  } catch { /* prune 尽力而为, 失败不影响主流程 */ }
+};
+
 const generateUuidV4 = () => {
   if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
     return crypto.randomUUID();
@@ -221,6 +259,25 @@ export const ActiveMsgStore = {
       tx.oncomplete = () => resolve();
       tx.onerror = () => reject(tx.error);
     });
+  },
+
+  // ─── XHS 跨轮笔记缓冲 (持久化) ─────────────────────────────────────────────
+  async saveXhsSessionNotes(
+    sessionId: string,
+    payload: { notes: unknown[]; xsecTokens: Array<[string, string]> },
+  ): Promise<void> {
+    if (!sessionId) return;
+    await setKv<XhsSessionNotes>(`${XHS_SESSION_NOTES_PREFIX}${sessionId}`, {
+      notes: payload.notes,
+      xsecTokens: payload.xsecTokens,
+      savedAt: Date.now(),
+    });
+    await pruneStaleXhsSessionNotes();
+  },
+
+  async getXhsSessionNotes(sessionId: string): Promise<XhsSessionNotes | null> {
+    if (!sessionId) return null;
+    return getKv<XhsSessionNotes>(`${XHS_SESSION_NOTES_PREFIX}${sessionId}`);
   },
 
   // ─── Phase 2 Round 2 wire: pending_tool_calls ─────────────────────────────

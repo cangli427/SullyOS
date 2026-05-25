@@ -1019,6 +1019,10 @@ export async function applyAssistantPostProcessing(
                 metadata: { xhsNote: note }
             });
             setMessages(await DB.getRecentMessagesByCharId(char.id, 200));
+        } else {
+            // 笔记缓冲为空 / 越界 → 卡片发不出来. instant 路径靠 saveXhsSessionNotes 持久化恢复,
+            // 走到这里说明恢复也没命中 (TTL 过期 / 跨 session), 留日志便于排查, 不再静默吞掉.
+            console.warn('📕 [XHS] XHS_SHARE 序号越界, 跳过卡片', { idx: idx + 1, available: lastXhsNotesRef.current.length });
         }
     }
     aiContent = aiContent.replace(/\[\[XHS_SHARE:\s*\d+\]\]/g, '').trim();

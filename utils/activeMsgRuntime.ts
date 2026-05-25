@@ -141,6 +141,23 @@ const processInboxMessageWithPostProcessing = async (message: ActiveMsg2InboxMes
     }
   }
 
+  // 恢复本 session round 1 工具抓到的 XHS 笔记: instantToolRunner 落了库, 这里读回内存单例.
+  // 跨 SW 唤醒 / 页面回收后内存 ref 被清空, 不恢复的话 round 2 的 [[XHS_SHARE]] / 评论 / 点赞
+  // 会因 lastXhsNotesRef 为空而静默掉卡片. 持久化优先于内存 (同 session 时两者等价, 重载后只剩持久化).
+  if (sessionId) {
+    try {
+      const persisted = await ActiveMsgStore.getXhsSessionNotes(sessionId);
+      if (persisted?.notes?.length) {
+        pushLastXhsNotesRef.current = persisted.notes as XhsNote[];
+        for (const [noteId, token] of (persisted.xsecTokens || [])) {
+          pushXhsCaches.xsecTokenCache.set(noteId, token);
+        }
+      }
+    } catch (e) {
+      console.warn('[ActiveMsg] restore xhs session notes failed', sessionId, e);
+    }
+  }
+
   await applyAssistantPostProcessing(message.body || '', {
     char,
     userProfile,
@@ -301,7 +318,7 @@ async function runPushTailPipeline(
   } catch { /* SSR-safe / not browser, ignore */ }
 }
 
-const flushInboxToChat = async () => {
+const flushInboxToChatImpl = async () => {
   const pendingMessages = await ActiveMsgStore.consumeInboxMessages();
   // consumeInboxMessages 是 "先 ack 后处理" 语义 —— inbox 已经原子地清空。
   // 这里 per-message try/catch: 单条处理抛错 (quota / DB 故障 / postprocess 异常) 不连累
@@ -420,6 +437,26 @@ const flushInboxToChat = async () => {
   }
 };
 
+// 串行化所有 flush. 两个原因:
+//   1. 防并发 flush 交错 saveMessage —— 显示顺序 = IndexedDB 自增 id = saveMessage 调用先后
+//      (见 db.ts getRecentMessagesByCharId 按 charId 索引游标取, 即 id 顺序), 并发就会乱序.
+//   2. 返回的 promise 在"本次及之前排队的 flush"全部完成后才 resolve, 这样调用方能
+//      await flushInboxToChat() 保证 round-1 旁白已落库, 再去跑 tool runner (它会触发 round-2),
+//      从根上消除跨轮 B 抢在 A 前面入库 (用户看到的 "B+A").
+// 每段都吞掉自身异常, 保证链不被一个失败的 flush 卡死.
+let flushChain: Promise<void> = Promise.resolve();
+const flushInboxToChat = (): Promise<void> => {
+  const next = flushChain.then(async () => {
+    try {
+      await flushInboxToChatImpl();
+    } catch (e) {
+      console.warn('[ActiveMsg] flushInboxToChat failed', e);
+    }
+  });
+  flushChain = next;
+  return next;
+};
+
 // Phase 2 Round 2: 真实 tool runner. 启动时排空 + SW postMessage 触发. 失败诊断在 instantToolRunner 内.
 const runPendingToolCallsSafely = async () => {
   try {
@@ -470,23 +507,26 @@ export const ActiveMsgRuntime = {
           return;
         }
 
-        // Phase 2 Round 2: SW 收到 tool_request push 且当前 window visible → 立即跑 runner.
+        // Phase 2 Round 2: SW 收到 tool_request push 且当前 window visible → 跑 runner.
         // 不 visible 时 SW 发的是 showNotification, 用户点击后落到 active-msg-open 分支,
         // ActiveMsgRuntime.init 时这里的启动消费会兜底 (runPendingToolCallsSafely).
+        // 先 flush 再跑 runner: 同一轮的旁白 (round-1 prefix) 是单独的 content push, 必须保证
+        // 它先入库, 再让 runner 触发 round-2, 否则 round-2 回复可能抢在旁白前面 ("B+A").
         if (type === 'instant-tool-request') {
-          void runPendingToolCallsSafely();
+          void flushInboxToChat().then(() => runPendingToolCallsSafely());
           return;
         }
 
         if (type === 'active-msg-open') {
-          void flushInboxToChat().then(() => {
+          // 严格串行: 先把 inbox 里的 round-1 旁白落库, 再跑 tool runner (它会触发 round-2),
+          // 保证用户回到界面时先看到旁白, 且 round-2 回复排在旁白之后.
+          void (async () => {
+            await flushInboxToChat();
             window.dispatchEvent(new CustomEvent('active-msg-open', {
               detail: { charId: event.data?.charId },
             }));
-          });
-          // notification → open 路径里大概率刚好有一条 pending_tool_call 等着 (visibility=false
-          // 时 SW 走的通知支线), 顺手消费一次.
-          void runPendingToolCallsSafely();
+            await runPendingToolCallsSafely();
+          })();
         }
       });
     }
@@ -499,16 +539,21 @@ export const ActiveMsgRuntime = {
     if (typeof document !== 'undefined') {
       document.addEventListener('visibilitychange', () => {
         if (document.visibilityState !== 'visible') return;
-        void flushInboxToChat();
-        void drainPendingDiaries(loadRealtimeConfigFromLocalStorage(), (charId) => {
-          window.dispatchEvent(new CustomEvent('active-msg-progress', { detail: { charId } }));
-        });
-        void runPendingToolCallsSafely();
+        // 先 await flush 落库 round-1 旁白, 再跑 runner 触发 round-2, 避免 "B+A".
+        void (async () => {
+          await flushInboxToChat();
+          void drainPendingDiaries(loadRealtimeConfigFromLocalStorage(), (charId) => {
+            window.dispatchEvent(new CustomEvent('active-msg-progress', { detail: { charId } }));
+          });
+          void runPendingToolCallsSafely();
+        })();
       });
     }
 
-    await runPendingToolCallsSafely();
+    // 启动兜底: 先 flush 落库 (含上次被杀进程时卡在 inbox 的 round-1 旁白), 再跑 runner
+    // 触发 round-2, 保证冷启动恢复时旁白也排在 round-2 回复之前.
     await flushInboxToChat();
+    await runPendingToolCallsSafely();
     void drainPendingDiaries(loadRealtimeConfigFromLocalStorage(), (charId) => {
       window.dispatchEvent(new CustomEvent('active-msg-progress', { detail: { charId } }));
     });
