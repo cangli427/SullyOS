@@ -1,7 +1,7 @@
 name: Android CI Build
 
 on:
-  workflow_dispatch: # 允许你手动点击按钮触发打包
+  workflow_dispatch: # 允许你手动点击
 
 jobs:
   build:
@@ -9,13 +9,13 @@ jobs:
 
     steps:
     - name: Checkout Code
-      uses: actions/checkout@v4
+      uses: actions/checkout@v3  # 降回最稳定的 v3 版本，防止官方 v4 抽风
 
     - name: Set up JDK 17
-      uses: actions/setup-java@v4
+      uses: actions/setup-java@v3  # 同样用最稳的 v3
       with:
         java-version: '17'
-        distribution: 'temurin'
+        distribution: 'zulu'       # 换成 zulu 镜像源，国内和国际连线最稳的节点
         cache: gradle
 
     - name: Grant Execute Permission for Gradlew
@@ -25,7 +25,8 @@ jobs:
       run: ./gradlew assembleDebug
 
     - name: Upload Generated APK artifact
-      uses: actions/upload-artifact@v4
+      uses: actions/upload-artifact@v3  # 保持版本一致性
       with:
         name: SillyOS-Client-Debug-APK
         path: app/build/outputs/apk/debug/*.apk
+
