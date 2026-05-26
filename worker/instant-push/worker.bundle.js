@@ -2489,6 +2489,8 @@ var replaceMarkdownLinks = (t) => t.replace(/\[([^\]]+)\]\([^)]+\)/g, "[\u94FE\u
 var replaceSendEmoji = (t) => t.replace(/\[\[SEND_EMOJI:\s*(.+?)\]\]/g, "[\u8868\u60C5\uFF1A$1]");
 var replaceEmojiReverseTag = (t) => t.replace(/\[(?:你|User|用户|System|[\w一-龥]+)\s*发送了表情包[:：]\s*(.*?)\]/g, "[\u8868\u60C5\uFF1A$1]");
 var replaceHtmlBlocks = (t) => t.replace(/\[html\][\s\S]*?\[\/html\]/gi, "[HTML \u5361\u7247]");
+var replaceTranslationForBanner = (t) => t.replace(/<翻译>\s*<原文>([\s\S]*?)<\/原文>\s*<译文>[\s\S]*?<\/译文>\s*<\/翻译>/g, "$1").replace(/<译文>[\s\S]*?<\/译文>/g, "").replace(/<\/?(?:翻译|原文)>/g, "");
+var replaceVoiceForBanner = (t) => t.replace(/<(语音|語音)>([\s\S]*?)<\/\1>/g, (_m, _tag, inner) => (inner || "").trim());
 var extractTranslationOriginal = (t) => {
   let result = t.replace(
     /<翻译>\s*<原文>([\s\S]*?)<\/原文>\s*<译文>[\s\S]*?<\/译文>\s*<\/翻译>/g,
@@ -2525,6 +2527,27 @@ function sanitizeForNotification(text) {
 function sanitizeIntoSegments(text) {
   let cleaned = stripLiteralBackslashN(text);
   cleaned = stripThinkBlocks(cleaned);
+  const SENTINEL = String.fromCharCode(2);
+  const blocks = [];
+  const protect = (raw, sanitized) => {
+    const idx = blocks.length;
+    blocks.push({ raw, sanitized });
+    return `
+${SENTINEL}B${idx}${SENTINEL}
+`;
+  };
+  cleaned = cleaned.replace(
+    /\[html\][\s\S]*?\[\/html\]/gi,
+    (m) => protect(m, "[HTML \u5361\u7247]")
+  );
+  cleaned = cleaned.replace(
+    /<翻译>\s*<原文>([\s\S]*?)<\/原文>\s*<译文>[\s\S]*?<\/译文>\s*<\/翻译>/g,
+    (m, original) => protect(m, (original || "").trim() || "[\u7FFB\u8BD1]")
+  );
+  cleaned = cleaned.replace(
+    /<(语音|語音)>([\s\S]*?)<\/\1>/g,
+    (m, _tag, inner) => protect(m, (inner || "").trim() || "[\u8BED\u97F3]")
+  );
   cleaned = extractTranslationOriginal(cleaned);
   cleaned = stripInnerState(cleaned);
   cleaned = stripBusinessTagsForNotification(cleaned);
@@ -2532,27 +2555,17 @@ function sanitizeIntoSegments(text) {
   cleaned = stripChineseDate(cleaned);
   cleaned = stripRoleNamePrefix(cleaned);
   cleaned = stripSourceTags(cleaned);
-  cleaned = stripQuotes(cleaned);
   cleaned = stripLegacyTrans(cleaned);
   cleaned = stripMarkdownDividers(cleaned);
-  const htmlBlocks = [];
-  cleaned = cleaned.replace(/\[html\][\s\S]*?\[\/html\]/gi, (m) => {
-    const idx = htmlBlocks.length;
-    htmlBlocks.push(m);
-    return `
-HTML${idx}
-`;
-  });
   const rawChunks = chunkText(cleaned);
-  const HTML_PLACEHOLDER_RE = /HTML(\d+)/;
+  const SOLO_RE = new RegExp(`^${SENTINEL}B(\\d+)${SENTINEL}$`);
+  const GLOBAL_RE = new RegExp(`${SENTINEL}B(\\d+)${SENTINEL}`, "g");
   const segments = [];
   for (const rawChunk of rawChunks) {
-    const htmlMatch = rawChunk.match(HTML_PLACEHOLDER_RE);
-    if (htmlMatch && htmlMatch[0] === rawChunk.trim()) {
-      const html = htmlBlocks[Number(htmlMatch[1])];
-      if (html) {
-        segments.push({ raw: html, sanitized: "[HTML \u5361\u7247]" });
-      }
+    const soloMatch = rawChunk.trim().match(SOLO_RE);
+    if (soloMatch) {
+      const blk = blocks[Number(soloMatch[1])];
+      if (blk) segments.push({ raw: blk.raw, sanitized: blk.sanitized });
       continue;
     }
     const parts = splitOnSendEmoji(rawChunk);
@@ -2564,8 +2577,10 @@ function sanitizeIntoSegments(text) {
         });
         continue;
       }
-      let rawText = part.text;
-      rawText = rawText.replace(/HTML(\d+)/g, (_m, n) => htmlBlocks[Number(n)] || "");
+      let rawText = part.text.replace(
+        GLOBAL_RE,
+        (_m, n) => blocks[Number(n)]?.raw || ""
+      );
       rawText = rawText.trim();
       if (!rawText) continue;
       const sanitized = sanitizeTextForBanner(rawText).trim();
@@ -2578,6 +2593,9 @@ function sanitizeIntoSegments(text) {
 function sanitizeTextForBanner(text) {
   let result = text;
   result = replaceHtmlBlocks(result);
+  result = replaceTranslationForBanner(result);
+  result = replaceVoiceForBanner(result);
+  result = stripQuotes(result);
   result = replaceEmojiReverseTag(result);
   result = replaceMarkdownLinks(result);
   result = stripMarkdownHeaders(result);
@@ -2590,11 +2608,11 @@ function chunkText(text) {
   const CJK = "\\u4e00-\\u9fff\\u3400-\\u4dbf\\u3000-\\u303f\\uff00-\\uffef\\u2000-\\u206f\\u2e80-\\u2eff\\u3001-\\u3003\\u2018-\\u201f\\u300a-\\u300f\\uff01-\\uff0f\\uff1a-\\uff20";
   const cjkSpaceRe = new RegExp(`(?<=[${CJK}])\\s+(?=[${CJK}])`);
   const lineChunks = text.split(/(?:\r\n|\r|\n|\u2028|\u2029)+/).map((c) => c.trim()).filter((c) => c.length > 0);
-  const SENTINEL = String.fromCharCode(0);
+  const SPACE_SENTINEL = String.fromCharCode(0);
   const out = [];
   for (const chunk of lineChunks) {
-    const guarded = chunk.replace(/\[{1,2}[^\[\]]*\]{1,2}/g, (m) => m.replace(/\s/g, SENTINEL));
-    const sub = guarded.split(cjkSpaceRe).map((c) => c.split(SENTINEL).join(" ").trim()).filter((c) => c.length > 0);
+    const guarded = chunk.replace(/\[{1,2}[^\[\]]*\]{1,2}/g, (m) => m.replace(/\s/g, SPACE_SENTINEL));
+    const sub = guarded.split(cjkSpaceRe).map((c) => c.split(SPACE_SENTINEL).join(" ").trim()).filter((c) => c.length > 0);
     out.push(...sub);
   }
   return out;

@@ -319,11 +319,73 @@ describe('sanitizeIntoSegments', () => {
     ]);
   });
 
-  it('<翻译> 块 → 取原文当一段, 译文剥光', () => {
+  it('<翻译> 整块保留给客户端 Step 8 双语渲染; banner 只显示原文', () => {
+    // raw 必须带完整 <翻译><原文>X</原文><译文>Y</译文></翻译>, 否则客户端
+    // applyAssistantPostProcessing.ts:1564 hasTranslationTags 配不上, 译文丢失.
     const segs = sanitizeIntoSegments('<翻译><原文>Hi</原文><译文>嗨</译文></翻译>');
+    expect(segs).toEqual([
+      {
+        raw: '<翻译><原文>Hi</原文><译文>嗨</译文></翻译>',
+        sanitized: 'Hi',
+      },
+    ]);
+  });
+
+  it('<翻译> 多行块 + 前后文 → 翻译整块独立成 segment, 不被 chunkText 切碎', () => {
+    const input = '前\n<翻译>\n<原文>Wait... seriously?</原文>\n<译文>等等… 你认真的吗？</译文>\n</翻译>\n后';
+    const segs = sanitizeIntoSegments(input);
+    expect(segs).toEqual([
+      { raw: '前', sanitized: '前' },
+      {
+        raw: '<翻译>\n<原文>Wait... seriously?</原文>\n<译文>等等… 你认真的吗？</译文>\n</翻译>',
+        sanitized: 'Wait... seriously?',
+      },
+      { raw: '后', sanitized: '后' },
+    ]);
+  });
+
+  it('残留 <译文> sibling tag (LLM 幻觉) → 兜底剥光, 不会产 segment', () => {
+    // 没被规范 <翻译> 包住的孤立 <译文> 仍按 extractTranslationOriginal 兜底剥
+    const segs = sanitizeIntoSegments('你好<译文>嗨</译文>再见');
+    expect(segs.map((s) => s.raw)).toEqual(['你好再见']);
+  });
+
+  it('<语音> 整块保留给客户端 extractVoiceTag 触发 auto-TTS', () => {
+    const segs = sanitizeIntoSegments('<语音>Hello world</语音>');
+    expect(segs).toEqual([
+      { raw: '<语音>Hello world</语音>', sanitized: 'Hello world' },
+    ]);
+  });
+
+  it('<语音> 多行内容 → 整块单 segment, 不被 chunkText 按 \\n 切碎', () => {
+    const input = '前面文字\n<语音>\nWait...\nare you serious?\n</语音>\n后面文字';
+    const segs = sanitizeIntoSegments(input);
+    expect(segs).toEqual([
+      { raw: '前面文字', sanitized: '前面文字' },
+      {
+        raw: '<语音>\nWait...\nare you serious?\n</语音>',
+        sanitized: 'Wait...\nare you serious?',
+      },
+      { raw: '后面文字', sanitized: '后面文字' },
+    ]);
+  });
+
+  it('引用 [[QUOTE:...]] 保留给客户端 Step 7 配 aiReplyTarget; banner 剥光', () => {
+    // worker 不再剥引用 — 否则客户端 firstQuoteMatch 配不上 → 没回复目标.
+    // 但 sanitizeTextForBanner 仍剥, 通知干净.
+    const segs = sanitizeIntoSegments('[[QUOTE: 用户的话]] 我的回复');
     expect(segs).toHaveLength(1);
-    expect(segs[0].raw).toBe('Hi');
-    expect(segs[0].sanitized).toBe('Hi');
+    expect(segs[0].raw).toBe('[[QUOTE: 用户的话]] 我的回复');
+    expect(segs[0].sanitized).toBe('我的回复');
+  });
+
+  it('引用 [回复 "..."]  中文形态同样保留 raw', () => {
+    // stripQuotes 的 REPLY_CLEAN_CN 正则把 `[回复 "..."]:` (含冒号) 一起吃掉, 所以
+    // banner 是干净的正文; raw 留全, 客户端 Step 7 用 REPLY_RE_CN 配出 aiReplyTarget.
+    const segs = sanitizeIntoSegments('[回复 "在干嘛"]: 在工作呀');
+    expect(segs).toHaveLength(1);
+    expect(segs[0].raw).toBe('[回复 "在干嘛"]: 在工作呀');
+    expect(segs[0].sanitized).toBe('在工作呀');
   });
 
   it('空串 / 全空白 → 空数组', () => {
